@@ -1,0 +1,23 @@
+# Shared pose-record validity cases, read by driver/tests/wire_tests.cpp (valid_pose)
+# and crates/steamvr-bridge (Pose::wire_valid / Pose::sanitized) so the rules cannot drift.
+# valid | position xyz | rotation wxyz | linear velocity xyz | angular velocity xyz | wire_valid | stays valid after sanitising
+1 0 0 0  1 0 0 0  0 0 0  0 0 0  1 1
+0 0 0 0  1 0 0 0  0 0 0  0 0 0  1 0
+0 0 0 0  0 0 0 0  0 0 0  0 0 0  1 0
+2 0 0 0  1 0 0 0  0 0 0  0 0 0  0 0
+1 0 0 0  2 0 0 0  0 0 0  0 0 0  0 1
+1 0 0 0  1.004 0 0 0  0 0 0  0 0 0  1 1
+1 0 0 0  0 0 0 0  0 0 0  0 0 0  0 0
+0 0 0 0  nan 0 0 0  0 0 0  0 0 0  0 0
+1 0 0 0  inf 0 0 0  0 0 0  0 0 0  0 0
+1 1000 -1000 0  1 0 0 0  0 0 0  0 0 0  1 1
+0 1000.1 0 0  1 0 0 0  0 0 0  0 0 0  0 0
+1 inf 0 0  1 0 0 0  0 0 0  0 0 0  0 0
+1 0 0 0  1 0 0 0  30 40 0  0 0 0  1 1
+1 0 0 0  1 0 0 0  30 40.1 0  0 0 0  0 0
+0 0 0 0  1 0 0 0  0 0 nan  0 0 0  0 0
+1 0 0 0  1 0 0 0  1e20 1e20 0  0 0 0  0 0
+1 0 0 0  1 0 0 0  0 0 0  60 80 0  1 1
+1 0 0 0  1 0 0 0  0 0 0  60 80.1 0  0 0
+1 0 0 0  1 0 0 0  0 0 0  inf 0 0  0 0
+0 0 0 0  1 0 0 0  0 0 0  0 0 -100.5  0 0

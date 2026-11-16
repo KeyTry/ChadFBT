@@ -1,0 +1,24 @@
+[package]
+name = "chadfbt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tracker-protocol = { path = "../tracker-protocol" }
+tracking-core = { path = "../tracking-core" }
+steamvr-bridge = { path = "../steamvr-bridge" }
+eframe = { version = "0.37.0", default-features = false, features = ["wgpu", "default_fonts", "accesskit"] }
+tray-icon = "0.26.1"
+glam = "0.30"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Real-time loop support: socket receive buffer, worker priority and 1 ms timer
+# resolution. Already pinned in Cargo.lock as a transitive dependency.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Media", "Win32_Networking_WinSock", "Win32_System_Threading"] }
+# Spoken calibration prompts: WinRT SpeechSynthesizer + MediaPlayer. Already
+# pinned in Cargo.lock as a transitive dependency; only these API features added.
+windows = { version = "0.62.2", features = ["Foundation", "Media_Core", "Media_Playback", "Media_SpeechSynthesis", "Storage_Streams"] }
+

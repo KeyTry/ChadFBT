@@ -1,0 +1,8 @@
+[package]
+name = "tracker-protocol"
+version = "0.1.0"
+edition = "2024"
+description = "Bounded, safe UDP decoder for WiFi inertial trackers"
+license = "MIT OR Apache-2.0"
+
+[dependencies]

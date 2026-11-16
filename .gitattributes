@@ -1,0 +1,4 @@
+# Keep the working tree identical on every platform: tests read fixtures byte for byte.
+* text=auto eol=lf
+*.dll binary
+*.png binary

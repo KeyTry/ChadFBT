@@ -1,0 +1,29 @@
+# Build output
+/target/
+/dist/
+/driver/build/
+/driver/build-cmake/
+/driver/chadfbt/bin/
+/driver/**/*.exe
+*.pdb
+*.ilk
+*.obj
+*.exp
+*.lib
+
+# Local captures, recordings, diagnostics and hardware identifiers.
+# Nothing recorded from a real session belongs in the repository.
+/local-data/
+
+# Logs and caches
+*.log
+__pycache__/
+*.pyc
+
+# Editors, tools and OS files
+.vs/
+.vscode/
+.idea/
+/.claude/
+.DS_Store
+Thumbs.db
