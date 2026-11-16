@@ -2670,6 +2670,7 @@ impl TrackingCore {
                 at_secs: now,
                 hip: body_chain.hip,
                 ankles: body_chain.ankles,
+                thigh_rotations: chain::THIGH.map(|i| rotations[i]),
                 calf_rotations: chain::CALF.map(|i| rotations[i]),
                 chest_rotation: rotations[chain::CHEST],
                 spine_rotation: body_chain.spine_rotation,

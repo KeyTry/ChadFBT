@@ -120,8 +120,10 @@ pub struct EstimatorSettings {
     /// displacement of the headset versus the leg chain while a foot is
     /// stationary. Experimental; a diagnostic of model consistency only.
     pub stance_heading: bool,
-    /// Contact-aware leg IK: holds planted feet in place, corrects the hips
-    /// toward them and flattens planted feet. Experimental; contact is inferred.
+    /// Contact-aware leg IK: locks planted feet horizontally, corrects the hips
+    /// toward them and flattens planted feet under a near-upright shin. Seated
+    /// and lying legs keep their measured knee angle. Experimental; contact is
+    /// inferred.
     pub leg_ik: bool,
     /// Ask the driver to forward angular velocity to SteamVR (frame unverified).
     pub angular_velocity_output: bool,

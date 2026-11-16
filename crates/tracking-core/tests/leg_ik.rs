@@ -23,6 +23,10 @@ const THIGH: f32 = 0.45;
 const CALF: f32 = 0.43;
 const ANKLE_TO_SOLE: f32 = 0.08;
 const DT: f64 = 0.01;
+/// Largest knee offset from the hip-ankle line that still counts as a straight
+/// leg. Not zero: the offset is `sqrt(thigh² − along²)`, so f32 rounding of a
+/// reach near full extension can show up as tens of micrometres.
+const STRAIGHT_KNEE_TOLERANCE_M: f32 = 1.0e-4;
 
 #[derive(Clone, Copy)]
 struct Pose {
@@ -253,8 +257,9 @@ fn sliding_foot_breaks_lock_requests_release_and_returns_to_fk_smoothly() {
             released_at = Some(t);
             assert!(out.lock_error_m[0] > 0.07);
             assert!(!out.foot_locked[0]);
-            // No jump on the release frame itself.
-            assert!(step < 1.0e-5, "release frame step {step}");
+            // No jump on the release frame itself (the soft-extension reach is
+            // a difference of two f32 terms, good to a few tens of micrometres).
+            assert!(step < 1.0e-4, "release frame step {step}");
             // The contact layer honours the request.
             planted[0] = false;
         }
@@ -347,32 +352,166 @@ fn knee_stays_on_measured_bend_side() {
 #[test]
 fn straight_fk_leg_bends_forward_never_backward() {
     let pose = Pose::standing(0.0);
-    for delta in [
-        Vec3::new(0.0, 0.0, -0.04),
-        Vec3::new(0.0, 0.0, 0.04),
-        Vec3::new(0.04, 0.0, 0.0),
-        Vec3::new(0.0, 0.03, 0.0),
+    // (rigid FK shift, whether the locked legs must bend). A shift that moves
+    // the hip joint away from or across the anchor only stretches a leg that is
+    // already straight; one with a downward part shortens the hip-anchor
+    // distance (3 cm down against at most 0.04²/(2·0.88) = 0.9 mm of sideways
+    // lengthening) and has to bend the knee, whatever its horizontal direction.
+    for (delta, bends) in [
+        (Vec3::new(0.0, 0.0, -0.04), false),
+        (Vec3::new(0.0, 0.0, 0.04), false),
+        (Vec3::new(0.04, 0.0, 0.0), false),
+        (Vec3::new(-0.04, 0.0, 0.0), false),
+        (Vec3::new(0.0, 0.03, 0.0), false),
+        (Vec3::new(0.0, -0.03, 0.0), true),
+        (Vec3::new(0.0, -0.03, 0.04), true),
+        (Vec3::new(0.0, -0.03, -0.04), true),
+        (Vec3::new(0.04, -0.03, 0.0), true),
+        (Vec3::new(-0.04, -0.03, 0.0), true),
     ] {
         let mut solver = LegIkSolver::new(LegIkConfig::default());
         solver.solve(&pose.input(0.0, [true; 2]));
-        let mut out = None;
         for k in 1..=10 {
-            out = Some(solver.solve(&shifted(pose.input(k as f64 * DT, [true; 2]), delta)));
-        }
-        let out = out.unwrap();
-        for s in 0..2 {
-            assert_bone_lengths(&out, s);
-            let bend = perpendicular(
-                out.knees[s] - out.hip_joints[s],
-                out.ankles[s] - out.hip_joints[s],
-            );
-            assert!(bend.length() > 1.0e-3);
-            assert!(
-                bend.normalize().z < -0.9,
-                "knee bent backward for {delta:?}: {bend:?}"
-            );
+            let out = solver.solve(&shifted(pose.input(k as f64 * DT, [true; 2]), delta));
+            for s in 0..2 {
+                assert!(out.foot_locked[s], "{delta:?} frame {k}");
+                assert_bone_lengths(&out, s);
+                let bend = perpendicular(
+                    out.knees[s] - out.hip_joints[s],
+                    out.ankles[s] - out.hip_joints[s],
+                );
+                if bends {
+                    // After the first frame the pelvis has taken at most 15 %
+                    // of its 60 % share and the anchor has sunk 3 % of the way:
+                    // over 2 cm of shortening is left, a knee offset of
+                    // sqrt(0.44·0.02) ≈ 9 cm; after 10 frames about 1 cm is
+                    // left (≈ 6 cm). 3 cm is a loose lower bound for both.
+                    assert!(
+                        bend.length() > 0.03,
+                        "{delta:?} frame {k}: expected a bent knee, got {bend:?}"
+                    );
+                    assert!(
+                        bend.normalize().z < -0.9,
+                        "knee bent backward for {delta:?}: {bend:?}"
+                    );
+                } else {
+                    // At full extension there is no bend direction to test,
+                    // so the leg must really be straight.
+                    assert!(
+                        bend.length() < STRAIGHT_KNEE_TOLERANCE_M,
+                        "{delta:?} frame {k}: a stretched leg bent by {bend:?}"
+                    );
+                }
+            }
         }
     }
+}
+
+/// Reach a straight leg gives up when asked to shorten by `d`: the solver's
+/// soft full extension, a cubic deadband `d³/(d² + s²)` with s = 5 mm.
+fn soft_extension(d: f32) -> f32 {
+    d * d * d / (d * d + 0.005 * 0.005)
+}
+
+#[test]
+fn sub_millimetre_vertical_noise_on_a_locked_straight_standing_leg_barely_moves_the_knee() {
+    // Standing upright the flexion guard is off (the floor prior owns the
+    // leg), so only the soft full extension keeps the knee still. A straight
+    // leg asked to shorten by δ shortens by e = δ³/(δ² + s²) (s = 5 mm), and a
+    // leg shortened by e has its knee sqrt(L·e) off the line with
+    // L = 2·thigh·calf/(thigh + calf) = 0.44 m. The knee offset is therefore
+    // sqrt(L·δ³/(δ² + s²)) ≈ δ^1.5·sqrt(L)/s: 0.52 mm for ±0.25 mm of noise,
+    // where the bare square root would give sqrt(0.44 m·0.25 mm) = 10 mm.
+    // Along the leg the knee rides with the pelvis, at most 2δ from one frame
+    // to the next.
+    let noise = 0.00025_f32;
+    let offset = (2.0 * THIGH * CALF / (THIGH + CALF) * soft_extension(noise)).sqrt();
+    assert!((0.00045..0.00058).contains(&offset), "{offset}");
+    let bound = offset.hypot(2.0 * noise) + STRAIGHT_KNEE_TOLERANCE_M;
+    let pose = Pose::standing(0.0);
+    for root in [false, true] {
+        let mut solver = LegIkSolver::new(LegIkConfig {
+            root_correction_enabled: root,
+            ..Default::default()
+        });
+        let mut previous = solver.solve(&pose.input(0.0, [true; 2])).knees;
+        let (mut largest, mut largest_offset) = (0.0_f32, 0.0_f32);
+        for k in 1..=200 {
+            let sign = if k % 2 == 0 { 1.0 } else { -1.0 };
+            let input = shifted(
+                pose.input(k as f64 * DT, [true; 2]),
+                Vec3::Y * (sign * noise),
+            );
+            let out = solver.solve(&input);
+            for s in 0..2 {
+                assert!(out.foot_locked[s]);
+                assert_bone_lengths(&out, s);
+                let step = (out.knees[s] - previous[s]).length();
+                largest = largest.max(step);
+                assert!(
+                    step < bound,
+                    "root {root} frame {k}: 0.25 mm of noise moved the knee {step} m"
+                );
+                // The part that shows: the knee leaving the leg line.
+                let bend = perpendicular(
+                    out.knees[s] - out.hip_joints[s],
+                    out.ankles[s] - out.hip_joints[s],
+                )
+                .length();
+                largest_offset = largest_offset.max(bend);
+                assert!(
+                    bend < offset + STRAIGHT_KNEE_TOLERANCE_M,
+                    "root {root} frame {k}: knee {bend} m off the leg line"
+                );
+            }
+            previous = out.knees;
+        }
+        eprintln!(
+            "standing leg, root {root}: largest knee step {largest:.6} m (bound {bound:.6}), largest offset {largest_offset:.6} m (model {offset:.6})"
+        );
+    }
+}
+
+#[test]
+fn near_full_extension_a_locked_ankle_slides_by_at_most_half_the_soft_extension_length() {
+    // The price of the deadband: a straight locked leg whose hip comes d closer
+    // to the anchor shortens by d³/(d² + s²) only, so the ankle passes its
+    // anchor by d·s²/(d² + s²). That is nearly all of a sub-millimetre d, at
+    // most s/2 = 2.5 mm (at d = s = 5 mm), and fades for a real bend.
+    let pose = Pose::standing(0.0);
+    let config = LegIkConfig {
+        root_correction_enabled: false,
+        // Keep the anchor where it was planted: below the floor height its
+        // height would follow FK by 3 % per frame.
+        anchor_vertical_tau_secs: 1.0e6,
+        ..Default::default()
+    };
+    let mut worst = 0.0_f32;
+    for millimetres in [0.25_f32, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0] {
+        let d = millimetres * 0.001;
+        let mut solver = LegIkSolver::new(config);
+        let anchors = solver.solve(&pose.input(0.0, [true; 2])).ankles;
+        let out = solver.solve(&shifted(pose.input(DT, [true; 2]), Vec3::NEG_Y * d));
+        let expected = d - soft_extension(d);
+        for s in 0..2 {
+            assert!(out.foot_locked[s]);
+            assert_bone_lengths(&out, s);
+            let slide = anchors[s] - out.ankles[s];
+            // Straight down the leg line, never sideways.
+            assert!(
+                slide.x.abs() < 1.0e-5 && slide.z.abs() < 1.0e-5,
+                "{slide:?}"
+            );
+            assert!(
+                (slide.y - expected).abs() < 5.0e-5,
+                "{millimetres} mm closer: ankle {} m below its anchor, model {expected}",
+                slide.y
+            );
+            assert!(slide.y < 0.0025 + 5.0e-5, "{millimetres} mm: {}", slide.y);
+            worst = worst.max(slide.y);
+        }
+    }
+    assert!(worst > 0.0024, "the sweep includes the worst case: {worst}");
 }
 
 #[test]

@@ -1,6 +1,6 @@
 # Validation record
 
-Evidence collected on the user's Windows machine on November 14, 2026. This document separates software checks, hardware transport observations, and unverified tracking claims.
+Evidence collected on the user's Windows machine from November 14, 2026 onward. Dated entries separate software checks, hardware transport observations, and unverified tracking claims. The latest entry, the seated and lying investigation of November 16, records synthetic checks and one replay; worn validation of those changes is pending.
 
 ## Build and environment
 
@@ -230,3 +230,162 @@ One user, six trackers on firmware 0.7.2, Quest over Steam Link, VRChat. Package
 - Calibration is no longer cleared by SteamVR-side events, and an Auto output mode connects without a manual step (previous subsection).
 
 **Not verified:** any of these changes on a worn body; whether the extra tracker is gone in VRChat; whether spoken prompts reach the headset; a deliberate double or triple tap; behaviour when seated (an upright seated torso still floats the feet by 3–11 cm in the recording); a real SteamVR restart or controllers/hands switch.
+
+### Seated and lying IK investigation — November 16, 2026
+
+The user reports that tracking works well overall, but hips appear too low and legs too high
+while seated and while lying in bed, in both the app view and the VR avatar. The work was done
+by AI coding agents in two passes, each with separate agents for numerical investigation,
+runtime tracing, primary-source research and independent review; the second pass followed a
+review that found the first pass incomplete and its documentation overstated, and was itself
+followed by an adversarial verification run whose findings changed the code again (below). No profile or body
+measurement was used, and all regression inputs are neutral synthetic values. Nothing in this
+entry has been tried on a worn body.
+
+**First pass: mechanisms reproduced synthetically and changed.**
+
+- *Forced knee bend at full extension.* The two-bone solver capped reach at the sum of the bone
+  lengths minus 1 mm. A leg shortened by `d` from straight moves its knee by about `√(thigh·d)`,
+  so that margin put roughly 2 cm of knee offset on every locked straight leg as soon as a tiny
+  anchor disagreement activated IK. Reproduced in a direct solver scenario (horizontal leg, 1 mm
+  root movement) and through the public core after a live neutral and forward calibration (a
+  sub-millimetre headset residual, three standing-space headings). The margin at full extension
+  was removed; the minimum reach stays positive and bounded.
+- *Floor pull-down of a seated leg.* A synthetic chair pose (horizontal thighs, vertical calves,
+  flexed torso) let the floor assumption lower the pelvis and legs by the whole torso budget.
+  The standing-floor weight now multiplies the calf taper (full through 40°, zero at 60°) by a
+  thigh taper (full through 60°, zero at 80°). It scales the pull-down and the planted anchor's
+  near-floor attraction. Conservative engineering thresholds, not measured contact
+  probabilities or values from a paper.
+- Below-floor raising stays independent of that weight; contact classification and horizontal
+  locking are unchanged. A folded leg's anchor height follows the inferred ankle height with a
+  lag, so `foot_locked` does not imply a fixed vertical position.
+- An isolated run of the original source failed three of the four new public-core tests
+  (reclining, standing-to-reclining transition, chair floor attraction); the stale-input safety
+  test already passed.
+
+**Second pass: what the first pass left open.**
+
+- *Removing the margin was not sufficient.* Without a margin a straight leg compressed by `d`
+  still raises its knee by `√(thigh·d)`: a few millimetres become a few centimetres. For a lying
+  or long-sitting wearer any headset motion toward the locked feet compresses the legs. A synthetic
+  end-to-end probe, run on the intermediate code, measured knee rise of several centimetres for
+  supine and floor-sitting poses under millimetre headset slides. Two changes address it:
+  the reach is softened near full extension and pinned to the measured leg, and a
+  measured-flexion guard (`knee_flex_slack_rad`) limits how far a foot lock may change the
+  knee angle from what the thigh and calf sensors measure, for legs without the standing-floor
+  weight; the remainder slides the ankle along the hip–anchor line. Upright standing legs are
+  unguarded as before. (Final form and defaults: next block.)
+- *Backward lean earned pull-down budget.* The budget now uses `TorsoFlexion::bow_vertical_m`:
+  forward and sideways torso tilt count, a straight backward lean (a recliner, lying supine)
+  earns nothing beyond the base.
+- *The budget was spent on gaps it could not explain.* A foot gap beyond the budget now fades
+  the pull to zero at twice the budget plus 5 cm (a jump, a step or box, a stool, a bed).
+- The thigh taper's thresholds became configuration (`support_thigh_full_tilt_rad`,
+  `support_thigh_zero_tilt_rad`), so the gate can be ablated in a replay by setting both to π or
+  more.
+
+**Adversarial verification and the follow-up it prompted.** A verifier agent ran synthetic
+end-to-end scenarios with exact synthetic truth through `TrackingCore`, with app-like jitter.
+Its findings and the resulting changes:
+
+- *Standing-still knee jitter roughly doubled* against the committed code with the first
+  (square-root, 3 mm) softening, because removing the 1 mm margin had also removed an accidental
+  deadband. The softening is now a cubic deadband `d³/(d² + s²)` with `s` = 5 mm.
+- *The guard switched on abruptly* near the end of the thigh taper when the slack angle was
+  widened with the standing-floor weight. The guarded and free reach are now blended linearly by
+  that weight. The default slack went from 2° to 1°, which caps the knee rise of a straight
+  0.45 m thigh at about 4 mm.
+- *Deep squats floated.* With the thigh taper alone, feet floated by several centimetres, up to
+  over ten, in deep squats when the synthetic spine model was in error. New
+  `squat_bow_start_tilt_rad` / `squat_bow_full_tilt_rad` (20° / 35°; both above π/2 ablates):
+  the standing-floor weight is now `max(thigh taper, bowed) × shank taper`, where `bowed` rises
+  with the forward lean of the mid-spine. A folded leg under a forward-bowed torso keeps the
+  prior; an upright or reclined seated wearer still loses it.
+- *A slowly moved leg while supine stayed on a stale anchor* (a 15° abduction left the ankle
+  well over 10 cm from the model). The lock-break radius, root-correction limit and anchor-creep
+  deadzone now use `TorsoFlexion::bow_horizontal_m`: a backward lean or supine torso earns no
+  widening, forward bows keep it.
+- `reach_margin_m` is capped inside the solve at a quarter of the reach range.
+- *A crawling leg's guarded ankle went through the floor* (found on the re-run): the guard moves
+  the ankle along the hip-to-anchor line, and on a downward line with a stale anchor the longer
+  reach carried it centimetres below the floor. With the floor clamp enabled the reach is now
+  shortened so the ankle stays at or above the floor margin; the floor outranks the measured
+  knee angle.
+
+Result on the synthetic probes: seated and lying poses (chair with feet on and off the floor,
+recline with footrest, supine flat, supine knees-up on a raised platform, side-lying, floor
+sitting, cross-legged) ended within about a centimetre of the synthetic truth at hip, knee and
+ankle, where the committed code dropped the pelvis by tens of centimetres for supine knees-up
+and raised the knees by centimetres for flat legs; headset slides toward locked flat feet no
+longer raise the knees by centimetres. Residuals the verifier still found: transitions through
+the tapers; a perched pose with a forward lean; side-lying and prone torsos still earn bow
+budget, so only the leg tapers protect them. The probes were re-run after the follow-up: the
+deep-squat and standing-jitter figures returned to the committed code's level, a slowly moved
+leg while supine now breaks its lock at the ordinary radius (it still trails the model by
+several centimetres until it does, as a standing foot would), and a seated wearer leaning
+35° or more forward with the feet off the floor is pulled toward the floor as in the committed
+code, with a fast pelvis rise when the torso straightens. Worst-case walking knee and ankle
+errors were a few millimetres larger than the committed code's. The probes are generated with the estimator's own body model: they show the code
+follows the model in these poses, not that the model matches a person.
+
+**Replay evidence (one session, no ground truth).** One recorded live session contains a short
+seated segment; no reclined or lying data exists. Replayed with and without the thigh taper, the
+earlier pull-down lowered the pelvis substantially during sit-down, stand-up and forward-leaning
+crouches, and the taper removed that while seated. This shows what each version of the code
+computes from the same inputs. It does not show where the body was. Replaying that session with
+the new settings ablated differed from the defaults by millimetres in upright-leg spans (median
+zero) and by centimetres only in seated or folded-leg spans. That bounds the standing regression
+risk in this one session; it is not an accuracy result.
+
+**Tests.**
+
+- New files: `tests/seated_ik.rs` (direct solver scenarios: chair, straight horizontal legs,
+  pelvis moving toward locked flat feet, along-leg noise, the guard's smoothness across the
+  thigh taper, reach-margin cap, supine leg abduction, crawling floor bound) and
+  `tests/reclined_tracking.rs` (public core: reclining at three headings, headset drift along
+  locked flat legs in both directions, supine knees-up on a raised platform, reclined chair with
+  dangling feet, side-lying, stand-sit-stand, forward-bowed parallel squat, crawling, stale
+  inputs). `tests/support_floor.rs` gained the thigh taper, backward-recline budget, unexplained
+  gap fade, squat-bow rule, ablation and sanitising cases. Where a setting exists, each test
+  also runs the scenario with that rule ablated and asserts the worse outcome.
+- Changed test: `straight_fk_leg_bends_forward_never_backward` no longer requires every scenario
+  to produce a bend. At exact full extension there is no bend direction to check, so the forward
+  pole is asserted only when the target requires a bend, a downward target was added, and the
+  test fails if no scenario bends.
+- Expectations changed in the second pass: in
+  `upright_torso_gets_only_the_base_budget_so_a_lifted_body_still_lifts`, a 20 cm jump with an
+  upright torso was previously pulled down by the 2 cm base budget and is now not pulled at all
+  (a gap within the budget is still closed in full); in
+  `sliding_foot_breaks_lock_requests_release_and_returns_to_fk_smoothly`, the release-frame step
+  tolerance went from 1e-5 m to 1e-4 m, because the softened reach is a difference of two `f32`
+  terms.
+- Suite result for this change: `cargo test --workspace` 490 passed, 0 failed (tracking-core 337); `cargo fmt --check` and `cargo clippy --workspace --all-targets` clean; release build via `toolsuild.ps1` succeeded.
+- Passing tests show the code follows its model. They are not a measurement of tracking accuracy
+  for a seated or lying person.
+
+**Known limits, not addressed.**
+
+- The torso is two rigid rods with no pelvis segment. Posterior pelvic tilt or a slouch when
+  sitting can leave the modelled pelvis a few centimetres low in the raw chain, before any
+  correction. Nothing models a seat or a bed height.
+- `normalize_chain_height` absorbs any leg/torso proportion error into `chest_to_hip_m`. That is
+  invisible standing and shifts the seated pelvis.
+- Pull-down transients can still occur while sitting down or standing up, while the leg passes
+  through the tapers or the torso leans forward.
+- A chair and a parallel squat have the same leg orientations and are told apart only by the
+  forward bow of the torso. A wearer leaning well forward on a seat with the feet off the floor
+  gets the pull-down back; a perched pose (thigh about 60–70°) with a forward lean and the feet
+  on a rung is still pulled down. Grounded seated feet under an upright torso can float when the
+  body model is inaccurate.
+- Side-lying and prone torsos still earn bow budget and lock slack; only the leg tapers protect
+  those poses.
+- All thresholds (taper and squat-bow angles, 1° slack, 5 mm deadband, the fade range) are
+  engineering choices without worn tuning.
+
+**Pending worn validation.** Sitting on a seat of known height with feet flat, reclining, lying
+flat on the floor and on a bed, and a deep squat, each with one standing calibration and
+**Contact-aware legs** compared on and off, recorded from before the calibration so the session
+can be replayed. Do not recalibrate seated to hide an offset. The procedure is in the
+[user guide](USER-GUIDE.md#sitting-and-lying-down); mechanisms, sources and their transfer limits
+are in [the investigation](research/seated-ik-investigation.md).

@@ -2,8 +2,9 @@
 
 Status: **design + implementation in progress, synthetic validation plus the replay of one
 recorded live session (see the dated section at the end).** Nothing in this document is a
-demonstrated accuracy result on worn hardware. Every component is individually
-switchable and reports diagnostics, so each can be ablated in recorded sessions.
+demonstrated accuracy result on worn hardware. Every layer has a switch in the app and reports
+diagnostics; the components inside a layer are configuration switches or gains that can be
+overridden when a recorded session is replayed (the few exceptions are noted in section 4).
 
 Prior art and positioning are in the [literature review](literature-review.md) and the
 [SlimeVR source review](slimevr-internals.md). In short: using an absolute position reference
@@ -227,17 +228,24 @@ Top-down forward kinematics puts every upstream error (neck model, spine, bone l
 the feet. With stationary-point hypotheses available the residual can be distributed instead.
 
 1. **Anchor.** When a foot becomes planted, its anchor is the FK ankle position. While planted,
-   the anchor creeps toward FK with τ = 4 s only for the part of the error beyond a 1 cm
-   deadzone, so slow systematic error never accumulates into a pop.
+   its horizontal coordinates creep toward FK with τ = 4 s only for the part of the error beyond
+   a 1 cm deadzone, so slow systematic error never accumulates into a pop. Height approaches a
+   target with τ = 0.3 s: the floor ankle height for an upright leg whose FK ankle is within 3 cm
+   of it, the FK height beyond 8 cm, blended between and weighted by the standing-floor prior
+   below. With that prior at zero the anchor height follows FK, so a lock need not fix the
+   foot's vertical coordinate.
 2. **Root correction.** `c_target = mean over planted feet of (anchor_s − fk_ankle_s)`, scaled
    by `root_gain = 0.6`, clamped to 5 cm, low-passed with τ = 60 ms, and decaying to zero with
    the same τ when nothing is planted. The pelvis moves by `c`; the chest moves by
    `c · L.neck_to_chest / (L.neck_to_chest + L.chest_to_hip)`; the neck and head do not move.
-3. **Foot lock.** After root correction, a planted ankle is placed exactly on its anchor when the
-   remaining error is ≤ 7 cm (otherwise the lock breaks and the contact is force-released), with
-   the reach clamped to `L.thigh + L.calf − 1 mm`. The knee is recomputed by two-bone IK from the
-   corrected hip joint to the anchor, using the FK knee as the pole so measured bend direction is
-   preserved. On release the positional offset decays with τ = 100 ms.
+3. **Foot lock.** After root correction, a planted ankle is steered to its anchor when the
+   remaining error is ≤ 7 cm (otherwise the lock breaks and the contact is force-released). The
+   knee is recomputed by two-bone IK from the corrected hip joint toward the anchor, using the FK
+   knee as the pole so measured bend direction is preserved. The reach is capped at
+   `L.thigh + L.calf` with no margin (the configured reach margin protects minimum reach only),
+   softened near full extension, and limited by the measured-flexion guard described
+   below, so the ankle sits on the anchor unless the bone lengths or that guard stop it along
+   the hip–anchor line. On release the positional offset decays with τ = 100 ms.
 4. **Foot orientation without a foot IMU.** Blend from "rigid with the calf" to "flat, heading
    only" by the planted weight (ramps over 80 ms) times a calf-tilt weight (1 below 40° from
    vertical, 0 above 60°, smoothstep between) so kneeling does not fold the foot through the
@@ -250,6 +258,65 @@ the feet. With stationary-point hypotheses available the residual can be distrib
    [Findings from the first live session](#findings-from-the-first-live-session-2026-11-15).
 
 Rotations of measured segments are never altered by IK. Positions remain `Evidence::Inferred`.
+
+**Seated and lying changes, 2026-11-16.** Status: synthetic regressions, one synthetic
+end-to-end probe and one replay with a short seated segment; **not validated on a worn body.**
+Details and evidence: [investigation](seated-ik-investigation.md). Current behaviour
+(`leg_ik.rs` is the source of truth):
+
+- **Standing-floor prior** `w = max(thigh taper, bowed) × calf taper`. The tapers are
+  `1 − smoothstep` of the bone's tilt from vertical: calf full through 40° and zero at 60° (the
+  flat-foot thresholds), thigh full through 60° and zero at 80° (`support_thigh_full_tilt_rad`,
+  `support_thigh_zero_tilt_rad`; both ≥ π ablates the thigh taper). `bowed` is a smoothstep of
+  the mid-spine's forward lean from 20° to 35° (`squat_bow_start_tilt_rad`,
+  `squat_bow_full_tilt_rad`; both above π/2 ablates it). `w` scales the `SupportFloor`
+  pull-down, the planted anchor's floor attraction and the flexion guard. It is a heuristic,
+  not a contact classifier. A chair and a parallel squat have the same leg orientations; a
+  squat balances the torso forward over the feet, so a folded leg under a forward-bowed torso
+  keeps the prior and an upright or reclined seated wearer loses it. Cost: leaning well forward
+  on a seat with the feet off the floor brings the pull-down back, and a perched pose with a
+  forward lean and the feet on a rung is still pulled down. Contact
+  eligibility, horizontal foot locks, below-floor raising and measured orientations do not
+  depend on it.
+- **Pull-down budget counts bows only.** `budget = 2 cm + 1.0·bow_vertical`, where
+  `bow_vertical` is `neck_to_chest·(1 − cos θ_chest) + chest_to_hip·(1 − cos θ_spine)` with each
+  term weighted 1 for a forward or sideways tilt and fading linearly to 0 for a straight
+  backward lean. A recliner or lying supine earns nothing beyond the base.
+- **Unexplained gaps fade the pull.** `pull = min(gap, budget, pelvis room) · w · explained`,
+  `explained = 1 − smoothstep(budget, 2·budget + 5 cm, gap)`: a foot further above the floor
+  than the budget can explain (a jump, a box or step, a stool, a bed) is not pulled, instead of
+  receiving the whole budget.
+- **No margin at full extension.** The previous maximum reach of `thigh + calf − 1 mm` forced
+  roughly 2 cm of knee bend on every locked straight leg, because a leg shortened by `d` moves
+  its knee by about `√(thigh·d)`.
+- **Soft full extension.** The shortening `d` from full extension is replaced by the cubic
+  deadband `d³/(d² + s²)`, `s` = 5 mm, pinned to the measured reach: a target at the FK distance
+  reproduces the FK leg, sub-millimetre noise barely moves a straight knee, and a real bend
+  converges to the plain solution.
+- **Measured-flexion guard** (`knee_flex_slack_rad`, 1°). The guarded reach keeps the knee's
+  interior angle within 1° of the one the thigh and calf sensors measure; the rest slides the
+  ankle along the hip–anchor line. The applied reach is `free + (guarded − free)·(1 − w)`, so an
+  upright standing leg is unguarded as before. Reason: with the square-root relation above,
+  4 mm of compression raises a straight knee by about 4 cm, so any headset motion toward locked
+  feet lifted the legs of a lying wearer. 1° caps the rise of a straight 0.45 m thigh at about
+  4 mm.
+- **Lock slack counts bows only.** The torso term added to the root-correction limit, the
+  lock-break radius and the anchor-creep deadzone is `0.3·bow_horizontal`: the horizontal reach
+  `neck_to_chest·sin θ_chest + chest_to_hip·sin θ_spine` with the same backward-lean fade as the
+  budget. A supine or reclined torso earns none, so a slowly moved leg is not held to a stale
+  anchor.
+- The reach margin is capped at a quarter of the reach range inside the solve.
+
+Not addressed: no seat or bed height is modelled and no pelvis position is measured; the torso
+is two rigid rods without a pelvis segment, so posterior pelvic tilt or a slouch can leave the
+seated pelvis a few centimetres low in the raw chain; `normalize_chain_height` puts any
+leg/torso proportion error into `chest_to_hip`, which standing hides and sitting does not;
+pull-down transients can occur while sitting down, as the leg passes through the tapers;
+side-lying and prone torsos still earn bow budget and slack, so only the leg tapers protect
+them. Every threshold here is an engineering choice, not a
+value from a paper or from worn tuning. Switches: the thigh taper and the squat-bow term by
+their thresholds, the guard by a large slack; the calf taper (shared with the flat foot), the
+backward-lean rules, the `explained` fade and the soft extension have none.
 
 ## 5. Prediction and velocities (`prediction.rs`)
 
@@ -292,7 +359,12 @@ human body.
 
 Status: **the changes below are checked on a replay of one recorded session and on synthetic
 regressions. They have not been tried live.** A replay has no ground truth; it shows what the
-current code computes from real inputs, not where the user's body was.
+then-current code computed from real inputs, not where the user's body was. **This section is a
+dated record of the 2026-11-15 code and is written in that day's present tense.** Its calf-only
+support rule, its budget for any torso tilt, its full-budget pull on large gaps (the 2 cm pull on
+upright jumps) and its numerical tables predate the 2026-11-16 changes described at the end of
+section 4, which is the current behaviour. The replay figures have not been regenerated with the
+current code.
 
 ### What was observed
 
@@ -319,7 +391,11 @@ avatar's feet sometimes left the ground while theirs stayed planted.
 
 ### What was changed
 
-All parts are individually switchable and reported in `EstimatorStatus`.
+All parts are reported in `EstimatorStatus`. Switches: the pull-down (`support_floor_enabled`) and
+the raise (`floor_clamp_enabled`) separately, the torso slack by `torso_slack_gain = 0` (since
+2026-11-16 the slack counts forward and sideways bows only), the
+legs-only filter by `estimate_torso_yaw`; all through configuration (replay `--estimator`), not
+from the app's UI, which switches whole layers.
 
 1. **Support-foot floor constraint with torso compliance** (`leg_ik::SupportFloor`, run before
    the contact layer so contacts and foot-lock anchors see the corrected ankles; the stance filter
@@ -328,17 +404,19 @@ All parts are individually switchable and reported in `EstimatorStatus`.
    down rigidly (chest by the spine fraction, neck and head fixed) until it rests at
    `ankle_to_sole`, by at most a compliance budget
    `0.02 m + 1.0·[neck_to_chest·(1 − cos θ_chest) + chest_to_hip·(1 − cos θ_spine)]`, the height
-   a rigid torso model loses with flexion. It applies only while the support shank is within 40°
-   of vertical (smoothstep to zero at 60°), never lowers the pelvis below 0.15 m, and is
-   low-passed with τ = 60 ms. Below the floor the body is raised at once by the full amount (up
+   a rigid torso model loses with flexion. As of 2026-11-15 it applied only while the support
+   shank was within 40° of vertical (smoothstep to zero at 60°); the thigh taper, bow-only budget
+   and fade-out were added on 2026-11-16 (section 4). It never lowers the pelvis below 0.15 m,
+   and is low-passed with τ = 60 ms. Below the floor the body is raised at once by the full amount (up
    to 2 m; a forward fold past horizontal put the replayed ankles 0.67 m below the floor). An
    upright torso gets about 2 cm, so jumps and lifted feet still lift.
 2. **Horizontal consistency in bends.** The torso's horizontal uncertainty
    `k·(neck_to_chest·sin θ_chest + chest_to_hip·sin θ_spine)` with `k = 0.3` is added to the
    root-correction limit (5 cm), the lock-break radius (7 cm) and the horizontal anchor-creep
    deadzone (1 cm). `k = 0.3` makes the lock radius about 24 cm in a 75° bow, which covers the
-   2–15 cm horizontal ankle errors seen in the bows. A planted anchor's height rests on the floor
-   while its ankle is within 3 cm of it (follows the model beyond 8 cm, τ = 0.3 s), so neither a
+   2–15 cm horizontal ankle errors seen in the bows. A planted anchor's height is drawn to the
+   floor while its ankle is within 3 cm of it (follows the model beyond 8 cm, τ = 0.3 s; since
+   2026-11-16 only in proportion to the standing-floor prior), so neither a
    swing offset captured at plant time nor a torso roll error that lifts one leg leaves a planted
    foot hovering. The contact tracker grants a torso allowance
    `0.5 · torso swing rate · torso length` (capped at 0.4 m/s) on its speed and vertical-speed
@@ -390,7 +468,9 @@ against 13.6 cm of head-down float and 15.8 cm / 11.2 cm with the previous estim
 bows leave every stance correction at 0.00° (previous filter: chest 10.5°, hip 8.4°); upright
 20 cm jumps still publish 18.1 cm of flight; a 30 cm knee lift publishes 30.0 cm with the support
 ankle within 0.1 cm of the floor; a chain 6 cm longer than the body raises the pelvis instead of
-bending the knees; kneeling, lying and long sitting are left alone.
+bending the knees; the covered horizontal-shank long-sitting/kneeling cases and low-pelvis lying
+case receive no pull-down. This does not cover ordinary chair sitting with vertical calves or a
+pelvis supported above the floor by a bed.
 
 Stance-filter regressions (`examples/stance_heading.rs`; the previous model is kept as a variant
 and reproduces its earlier numbers exactly): unchanged in substance for walking drift, sudden
@@ -416,7 +496,11 @@ columns helped it); with them on it converges in 9.8 s as before.
 - **The compliance budget is a model assumption** (the support foot is on a flat floor at the
   SteamVR floor height; the missing height is in the torso). It does not cover model error with
   an upright torso: sitting on a chair still left the replayed feet 3–11 cm above the floor
-  (0.4 % of frames). A wrong SteamVR floor makes the constraint wrong.
+  (0.4 % of frames). A wrong SteamVR floor makes the constraint wrong. Near-horizontal thighs
+  with vertical calves do not prove a planted foot; chair sitting with raised feet remains
+  ambiguous. Bed support is unmeasured. The 2026-11-16 changes discount floor attraction and
+  keep the measured knee angle in these configurations without identifying a seat or bed, and
+  live seated/lying validation is still pending.
 - **The constants are fitted to one session of one user** (k = 0.3, gain 1.0, ρ_torso 0.5,
   double-support 0.3 m/s, torso allowance gain 0.5). Their transfer to other bodies, straps and
   motions is untested.

@@ -44,6 +44,13 @@ const MAX_RAISE_M: f32 = 2.0;
 /// Support floor: inputs outside these magnitudes are treated as unusable.
 const MAX_SOLE_M: f32 = 1.0;
 const MAX_POSITION_M: f32 = 1.0e4;
+/// Two-bone IK: softening length of the reach near full extension (meters). The
+/// knee offset of a leg shortened by `d` from straight is `sqrt(L·d)`, which has
+/// an unbounded slope at `d = 0`. The reach uses `d³/(d² + s²)` in place of `d`:
+/// a smooth deadband (knee offset ∝ d^1.5/s, about half a millimetre for 0.25 mm
+/// of noise) that converges to `d` for a real bend, so sub-millimetre noise on a
+/// locked straight leg does not flicker the knee.
+const FULL_EXTENSION_SOFT_M: f32 = 0.005;
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -60,19 +67,37 @@ pub struct LegIkConfig {
     pub floor_clamp_enabled: bool,
     /// [`SupportFloor`]: when the lowest usable ankle is above the floor, lower
     /// the pelvis and both legs until it rests at `ankle_to_sole_m`, by at most
-    /// the torso compliance budget and only while that shank is near vertical.
+    /// the torso compliance budget, weighted down as the thigh or shank tilts.
     pub support_floor_enabled: bool,
-    /// Pull-down budget with an upright torso (meters).
+    /// Pull-down budget with an upright torso (meters). A gap beyond the budget
+    /// fades the pull out (to none at twice the budget plus 5 cm).
     pub support_floor_base_m: f32,
     /// Budget gain `c` on the torso flexion slack
-    /// `neck_to_chest·(1 − cos chest tilt) + chest_to_hip·(1 − cos spine tilt)`.
+    /// `neck_to_chest·(1 − cos chest tilt) + chest_to_hip·(1 − cos spine tilt)`,
+    /// counting forward and sideways tilt only ([`TorsoFlexion::bow_vertical_m`]).
     pub support_floor_tilt_gain: f32,
     /// Low-pass time constant of the pull-down (raising below the floor is immediate).
     pub support_floor_tau_secs: f32,
     /// The pull-down never lowers the FK pelvis centre below this height (meters).
     pub support_floor_min_hip_height_m: f32,
+    /// Thigh tilt from vertical below which the standing-floor prior
+    /// ([`SupportFloor`] pull-down and the planted-anchor floor attraction) has
+    /// full weight, and above which it has none. A heuristic that discounts
+    /// seated and lying legs, not a contact classifier. Setting both at or above
+    /// π ablates the thigh gate.
+    pub support_thigh_full_tilt_rad: f32,
+    pub support_thigh_zero_tilt_rad: f32,
+    /// Forward lean of the mid-spine over which a folded thigh gets the
+    /// standing-floor prior back (none below the first, all above the second).
+    /// A chair and a parallel squat fold the legs alike; a squat balances the
+    /// torso forward over the feet, and without this its feet float by the whole
+    /// flexed-spine error. Wrong for a wearer who leans this far forward on a
+    /// seat with the feet off the floor. Setting both above π/2 ablates it.
+    pub squat_bow_start_tilt_rad: f32,
+    pub squat_bow_full_tilt_rad: f32,
     /// Gain `k` of the torso's horizontal uncertainty
-    /// `k·(neck_to_chest·sin chest tilt + chest_to_hip·sin spine tilt)`, added to
+    /// `k·(neck_to_chest·sin chest tilt + chest_to_hip·sin spine tilt)`, counting
+    /// forward and sideways tilt only ([`TorsoFlexion::bow_horizontal_m`]), added to
     /// `root_max_m`, `lock_break_m` and `anchor_deadzone_m`. Zero restores the
     /// fixed limits. The default 0.3 makes the lock radius 7 cm + 0.3·0.58 m·sin θ
     /// (≈ 24 cm in a 75° bow), which covers the 2–15 cm horizontal ankle errors the
@@ -85,10 +110,10 @@ pub struct LegIkConfig {
     pub anchor_creep_tau_secs: f32,
     /// Time constant with which a planted anchor's height approaches its target,
     /// without a deadzone. Zero snaps it. The target is the floor ankle height
-    /// (`ankle_to_sole_m`) while the floor-corrected FK ankle is up to
+    /// (`ankle_to_sole_m`) for an upright leg while the floor-corrected FK ankle is up to
     /// `planted_floor_full_m` above it, the FK height beyond `planted_floor_zero_m`
-    /// (blended between) and at or below the floor: planted feet near the floor
-    /// rest on it.
+    /// (blended between) and at or below the floor. As the leg tilts, the target
+    /// transitions toward FK height; this is a standing prior, not a contact test.
     pub anchor_vertical_tau_secs: f32,
     pub planted_floor_full_m: f32,
     pub planted_floor_zero_m: f32,
@@ -101,8 +126,22 @@ pub struct LegIkConfig {
     /// Remaining error after root correction above which the lock breaks (plus
     /// the torso slack).
     pub lock_break_m: f32,
-    /// The ankle is kept at least this far inside full extension / full flexion.
+    /// Distance kept inside the full-flexion reach limit, bounded by full extension.
+    /// Full extension is allowed; a positive minimum also avoids division by zero.
     pub reach_margin_m: f32,
+    /// How far a foot lock may change the knee's flexion angle from the one the
+    /// thigh and calf sensors measure (radians, either direction). The lock is a
+    /// hypothesis and the two orientations are measurements: beyond this the
+    /// ankle slides along the hip-ankle line instead of the knee bending. Without
+    /// it a straight leg compressed by `d` raises its knee by `sqrt(thigh·d)`
+    /// (4 mm -> 4 cm), which lifted the legs of a lying or long-sitting wearer
+    /// whenever the head-down chain moved toward locked feet. Applies to legs
+    /// without the standing-floor prior (thigh or shank tilted, see
+    /// `support_thigh_*` and `flat_*_tilt_rad`); the guarded and the free reach
+    /// are blended by that prior's weight, so an upright leg, where the floor is
+    /// the stronger evidence, is not limited. The default 1° caps the knee rise
+    /// of a straight 0.45 m thigh at about 4 mm.
+    pub knee_flex_slack_rad: f32,
     /// Decay time constant of the positional offset left by a released lock.
     pub release_tau_secs: f32,
     /// Not in the spec: bounds the release offset so a tracking-space jump does
@@ -136,6 +175,10 @@ impl Default for LegIkConfig {
             support_floor_tilt_gain: 1.0,
             support_floor_tau_secs: 0.06,
             support_floor_min_hip_height_m: 0.15,
+            support_thigh_full_tilt_rad: 60.0_f32.to_radians(),
+            support_thigh_zero_tilt_rad: 80.0_f32.to_radians(),
+            squat_bow_start_tilt_rad: 20.0_f32.to_radians(),
+            squat_bow_full_tilt_rad: 35.0_f32.to_radians(),
             torso_slack_gain: 0.3,
             anchor_deadzone_m: 0.01,
             anchor_creep_tau_secs: 4.0,
@@ -147,6 +190,7 @@ impl Default for LegIkConfig {
             root_tau_secs: 0.06,
             lock_break_m: 0.07,
             reach_margin_m: 0.001,
+            knee_flex_slack_rad: 1.0_f32.to_radians(),
             release_tau_secs: 0.1,
             release_offset_max_m: 0.25,
             plant_ramp_secs: 0.08,
@@ -176,6 +220,22 @@ impl LegIkConfig {
             } else {
                 d.support_floor_min_hip_height_m
             },
+            support_thigh_full_tilt_rad: nonneg(
+                self.support_thigh_full_tilt_rad,
+                d.support_thigh_full_tilt_rad,
+            ),
+            support_thigh_zero_tilt_rad: nonneg(
+                self.support_thigh_zero_tilt_rad,
+                d.support_thigh_zero_tilt_rad,
+            ),
+            squat_bow_start_tilt_rad: nonneg(
+                self.squat_bow_start_tilt_rad,
+                d.squat_bow_start_tilt_rad,
+            ),
+            squat_bow_full_tilt_rad: nonneg(
+                self.squat_bow_full_tilt_rad,
+                d.squat_bow_full_tilt_rad,
+            ),
             torso_slack_gain: nonneg(self.torso_slack_gain, d.torso_slack_gain),
             anchor_deadzone_m: nonneg(self.anchor_deadzone_m, d.anchor_deadzone_m),
             anchor_creep_tau_secs: nonneg(self.anchor_creep_tau_secs, d.anchor_creep_tau_secs),
@@ -194,6 +254,7 @@ impl LegIkConfig {
             root_tau_secs: nonneg(self.root_tau_secs, d.root_tau_secs),
             lock_break_m: nonneg(self.lock_break_m, d.lock_break_m),
             reach_margin_m: nonneg(self.reach_margin_m, d.reach_margin_m),
+            knee_flex_slack_rad: nonneg(self.knee_flex_slack_rad, d.knee_flex_slack_rad),
             release_tau_secs: nonneg(self.release_tau_secs, d.release_tau_secs),
             release_offset_max_m: nonneg(self.release_offset_max_m, d.release_offset_max_m),
             plant_ramp_secs: nonneg(self.plant_ramp_secs, d.plant_ramp_secs),
@@ -214,6 +275,14 @@ impl LegIkConfig {
         if c.flat_zero_tilt_rad < c.flat_full_tilt_rad {
             c.flat_full_tilt_rad = d.flat_full_tilt_rad;
             c.flat_zero_tilt_rad = d.flat_zero_tilt_rad;
+        }
+        if c.support_thigh_zero_tilt_rad < c.support_thigh_full_tilt_rad {
+            c.support_thigh_full_tilt_rad = d.support_thigh_full_tilt_rad;
+            c.support_thigh_zero_tilt_rad = d.support_thigh_zero_tilt_rad;
+        }
+        if c.squat_bow_full_tilt_rad < c.squat_bow_start_tilt_rad {
+            c.squat_bow_start_tilt_rad = d.squat_bow_start_tilt_rad;
+            c.squat_bow_full_tilt_rad = d.squat_bow_full_tilt_rad;
         }
         if c.planted_floor_zero_m < c.planted_floor_full_m {
             c.planted_floor_full_m = d.planted_floor_full_m;
@@ -281,7 +350,9 @@ pub struct LegIkOutput {
     pub knees: [Vec3; 2],
     pub ankles: [Vec3; 2],
     pub foot_rotations: [Quat; 2],
-    /// The ankle was placed on its anchor this frame.
+    /// The ankle was steered to its anchor this frame. It sits on the anchor
+    /// unless the bone lengths or the measured-flexion guard stopped it along
+    /// the hip-anchor line.
     pub foot_locked: [bool; 2],
     /// Anchor minus root-corrected FK ankle (0 without an anchor).
     pub lock_error_m: [f32; 2],
@@ -337,6 +408,54 @@ fn axis_tilt(rotation: Quat) -> f32 {
     }
 }
 
+/// Forward lean of a segment (radians, 0..π/2): how far its anatomical forward
+/// axis points below horizontal. Zero for an upright, sideways or backward lean.
+fn forward_lean(rotation: Quat) -> f32 {
+    match valid_rotation(rotation) {
+        Some(q) => {
+            let down = (-(q * Vec3::NEG_Z).y).clamp(0.0, 1.0);
+            // Folded past horizontal (head below the pelvis) still counts as a
+            // full forward lean rather than reading as a shallow one again.
+            if down > 0.0 && (q * Vec3::Y).y < 0.0 {
+                std::f32::consts::FRAC_PI_2
+            } else {
+                down.asin()
+            }
+        }
+        None => 0.0,
+    }
+}
+
+/// Heuristic for the standing-floor prior, not a contact classifier. The thigh
+/// taper (default 60–80°) is wider than the shank gate so ordinary squats keep
+/// the prior longer. A chair and a parallel squat have the same leg
+/// orientations; a torso bowed forward (`squat_bow_*`) tells them apart well
+/// enough to keep the prior in a squat, and a seated wearer who is upright or
+/// leaning back loses it.
+fn upright_leg_weight(thigh: Quat, calf: Quat, spine: Quat, cfg: &LegIkConfig) -> f32 {
+    let (Some(thigh), Some(calf)) = (valid_rotation(thigh), valid_rotation(calf)) else {
+        return 0.0;
+    };
+    let bowed = smoothstep(
+        cfg.squat_bow_start_tilt_rad,
+        cfg.squat_bow_full_tilt_rad,
+        forward_lean(spine),
+    );
+    let thigh_weight = 1.0
+        - smoothstep(
+            cfg.support_thigh_full_tilt_rad,
+            cfg.support_thigh_zero_tilt_rad,
+            axis_tilt(thigh),
+        );
+    let calf_weight = 1.0
+        - smoothstep(
+            cfg.flat_full_tilt_rad,
+            cfg.flat_zero_tilt_rad,
+            axis_tilt(calf),
+        );
+    thigh_weight.max(bowed) * calf_weight
+}
+
 /// How far a flexed torso can be wrong, from the tilts of the chest and of the
 /// mid-spine (both measured on soft tissue and modelled as rigid rods).
 ///
@@ -345,10 +464,33 @@ fn axis_tilt(rotation: Quat) -> f32 {
 /// torso model can lose in a bend; `horizontal_m = neck_to_chest·sin θ_chest +
 /// chest_to_hip·sin θ_spine` is the torso's horizontal reach. Both are zero for
 /// an upright torso.
+///
+/// `bow_vertical_m` is `vertical_m` with each segment's term faded out as that
+/// segment leans backward (full weight for a forward or sideways tilt, none for
+/// a straight backward one). The height a head-down chain loses is a property of
+/// a spine flexed over standing legs; a torso reclined against a backrest or
+/// lying supine is supported, not bowed, so it earns no floor pull-down budget.
+/// The direction is each sensor's own forward axis against gravity, so heading
+/// drift does not affect it.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct TorsoFlexion {
     pub vertical_m: f32,
     pub horizontal_m: f32,
+    pub bow_vertical_m: f32,
+    /// `horizontal_m` with the same backward-lean fade: the widening of the lock
+    /// radius and creep deadzone that a bow earns. A supine torso earns none, so
+    /// a lying wearer's slowly moved leg is not held to a stale anchor.
+    pub bow_horizontal_m: f32,
+}
+
+/// 1 while a tilted segment's anatomical forward axis points level or downward
+/// (forward or sideways lean), fading linearly to 0 for a straight backward lean.
+fn bow_weight(rotation: Quat, tilt: f32) -> f32 {
+    let sin = tilt.sin();
+    match valid_rotation(rotation) {
+        Some(q) if sin > 1.0e-3 => (1.0 - (q * Vec3::NEG_Z).y / sin).clamp(0.0, 1.0),
+        _ => 0.0,
+    }
 }
 
 impl TorsoFlexion {
@@ -372,8 +514,16 @@ impl TorsoFlexion {
         let flexion = Self {
             vertical_m: n * (1.0 - chest.cos()) + h * (1.0 - spine.cos()),
             horizontal_m: n * chest.sin() + h * spine.sin(),
+            bow_vertical_m: n * (1.0 - chest.cos()) * bow_weight(chest_rotation, chest)
+                + h * (1.0 - spine.cos()) * bow_weight(spine_rotation, spine),
+            bow_horizontal_m: n * chest.sin() * bow_weight(chest_rotation, chest)
+                + h * spine.sin() * bow_weight(spine_rotation, spine),
         };
-        if flexion.vertical_m.is_finite() && flexion.horizontal_m.is_finite() {
+        if flexion.vertical_m.is_finite()
+            && flexion.horizontal_m.is_finite()
+            && flexion.bow_vertical_m.is_finite()
+            && flexion.bow_horizontal_m.is_finite()
+        {
             flexion
         } else {
             Self::default()
@@ -390,6 +540,7 @@ pub struct SupportFloorInput {
     /// below `support_floor_min_hip_height_m`).
     pub hip: Vec3,
     pub ankles: [Vec3; 2],
+    pub thigh_rotations: [Quat; 2],
     pub calf_rotations: [Quat; 2],
     pub chest_rotation: Quat,
     pub spine_rotation: Quat,
@@ -413,12 +564,13 @@ pub struct SupportFloorDiagnostics {
     pub budget_m: f32,
     /// Lowest usable FK ankle (`0` left, `1` right), if any.
     pub support_foot: Option<u8>,
-    /// Shank-tilt weight of the support foot: 1 within `flat_full_tilt_rad` of
-    /// vertical, 0 beyond `flat_zero_tilt_rad`.
+    /// Upright-leg weight for the support foot: both thigh and shank must be
+    /// near vertical for the full downward floor assumption.
     pub support_weight: f32,
     /// Lowest usable FK ankle height minus `ankle_to_sole_m`, before correction.
     pub gap_m: f32,
-    /// The budget, the shank weight or the pelvis height guard left the support
+    /// The budget, its fade for an unexplained gap, the upright-leg weight or the
+    /// pelvis height guard left the support
     /// ankle above the floor by more than 5 mm.
     pub limited: bool,
     /// The lowest ankle was below the floor and the body was raised.
@@ -433,9 +585,12 @@ pub struct SupportFloorDiagnostics {
 /// This treats the lower torso as the compliant, unmeasured part: the pelvis
 /// and both legs are translated vertically (no rotation changes, bone lengths
 /// kept) so that the lowest usable ankle rests on the floor, but a pull-down
-/// may not exceed `base + gain·TorsoFlexion::vertical_m` and only applies while
-/// that shank is near vertical (kneeling, sitting or lying on the floor are left
-/// alone). An ankle below the floor raises the body by the full amount at once.
+/// may not exceed `base + gain·TorsoFlexion::bow_vertical_m` (a backward lean
+/// earns nothing), fades out when the gap is beyond what that budget can
+/// explain, and only applies while
+/// that thigh and shank are near vertical. This is a heuristic, not evidence of
+/// contact: it also reduces the assumption during a deep squat. An ankle below
+/// the floor raises the body by the full amount at once.
 ///
 /// It runs before contacts and leg IK so anchors are captured on the corrected
 /// skeleton. Positions stay inferred evidence: this is a model assumption that
@@ -502,18 +657,28 @@ impl SupportFloor {
             return out;
         };
         let gap = input.ankles[s].y - floor;
-        let tilt = axis_tilt(input.calf_rotations[s]);
-        let weight = 1.0 - smoothstep(cfg.flat_full_tilt_rad, cfg.flat_zero_tilt_rad, tilt);
+        let weight = upright_leg_weight(
+            input.thigh_rotations[s],
+            input.calf_rotations[s],
+            input.spine_rotation,
+            &cfg,
+        );
         let flexion = TorsoFlexion::new(
             input.chest_rotation,
             input.spine_rotation,
             input.neck_to_chest_m,
             input.chest_to_hip_m,
         );
-        let budget = cfg.support_floor_base_m + cfg.support_floor_tilt_gain * flexion.vertical_m;
+        let budget =
+            cfg.support_floor_base_m + cfg.support_floor_tilt_gain * flexion.bow_vertical_m;
         let hip_room = (input.hip.y - cfg.support_floor_min_hip_height_m).max(0.0);
+        // The budget is the largest height error the torso model can explain. A
+        // gap well beyond it contradicts "this foot is on the floor" (a jump, a
+        // step or box, a stool, a bed), so the pull fades out instead of spending
+        // the whole budget on a hypothesis that cannot close the gap anyway.
+        let explained = 1.0 - smoothstep(budget, 2.0 * budget + 0.05, gap);
         let pull = if cfg.support_floor_enabled {
-            gap.max(0.0).min(budget).min(hip_room) * weight
+            gap.max(0.0).min(budget).min(hip_room) * weight * explained
         } else {
             0.0
         };
@@ -652,7 +817,7 @@ impl LegIkSolver {
                 input.neck_to_chest_m,
                 input.chest_to_hip_m,
             )
-            .horizontal_m;
+            .bow_horizontal_m;
         let deadzone = cfg.anchor_deadzone_m + slack;
 
         // Step 1: release-offset decay, anchor capture / creep, unplant release.
@@ -679,15 +844,24 @@ impl LegIkSolver {
                 if distance > deadzone {
                     *anchor += horizontal * ((distance - deadzone) / distance * creep);
                 }
-                // Vertical: a planted foot near the floor rests on it; one clearly
-                // above it (a step, a box) follows the floor-corrected FK height. No
+                // Vertical: an upright-leg foot near the floor is biased toward it;
+                // a tilted or clearly elevated foot follows floor-corrected FK height
+                // with a lag, even while the horizontal anchor remains locked. No
                 // deadzone, so an anchor captured with a leftover swing offset does
                 // not keep a planted foot hovering or sunk, and a torso roll error
                 // that lifts only the other leg's FK ankle does not lift that foot.
                 // At or just below the floor (within the support floor's margin)
                 // the FK height is kept, so this never fights `SupportFloor`.
                 let above = input.ankles[s].y - input.ankle_to_sole_m;
-                let free = smoothstep(cfg.planted_floor_full_m, cfg.planted_floor_zero_m, above);
+                let floor_free =
+                    smoothstep(cfg.planted_floor_full_m, cfg.planted_floor_zero_m, above);
+                let upright = upright_leg_weight(
+                    input.thigh_rotations[s],
+                    input.calf_rotations[s],
+                    input.spine_rotation,
+                    &cfg,
+                );
+                let free = 1.0 - upright * (1.0 - floor_free);
                 let target = if above <= 0.0 {
                     input.ankles[s].y
                 } else {
@@ -799,6 +973,24 @@ impl LegIkSolver {
                     input.thigh_m,
                     input.calf_m,
                     cfg.reach_margin_m,
+                    // An upright leg stands on the floor prior: its axis is
+                    // vertical and the floor bounds the foot, so there the lock
+                    // may bend the knee as before. Folded, seated and lying
+                    // legs have no such prior and keep their measured flexion.
+                    cfg.knee_flex_slack_rad,
+                    1.0 - upright_leg_weight(
+                        input.thigh_rotations[s],
+                        input.calf_rotations[s],
+                        input.spine_rotation,
+                        &cfg,
+                    ),
+                    // Never below the floor `SupportFloor` keeps FK above, unless
+                    // the target itself is lower.
+                    if cfg.floor_clamp_enabled {
+                        (input.ankle_to_sole_m - cfg.floor_margin_m).min(target.y)
+                    } else {
+                        f32::NEG_INFINITY
+                    },
                     cfg.straight_knee_m,
                 )
             };
@@ -873,7 +1065,10 @@ impl LegIkSolver {
 /// The FK triangle's knee offset from its hip-ankle line is carried to the new
 /// hip-target line by the minimal rotation between the two lines. When the FK leg
 /// is (nearly) straight that offset is (nearly) zero, and the thigh's forward
-/// axis takes over continuously.
+/// axis takes over continuously. The reach is the target distance, softened near
+/// full extension and, by the fraction `flexion_guard`, limited to the measured
+/// knee flexion ± `knee_flex_slack_rad`, so the returned ankle can stop short of
+/// (or pass) the target along that line.
 #[allow(clippy::too_many_arguments)]
 fn two_bone(
     hip: Vec3,
@@ -885,6 +1080,9 @@ fn two_bone(
     thigh: f32,
     calf: f32,
     margin: f32,
+    knee_flex_slack_rad: f32,
+    flexion_guard: f32,
+    min_ankle_y: f32,
     straight_knee_m: f32,
 ) -> (Vec3, Vec3) {
     let fk_line = fk_ankle - fk_hip;
@@ -898,9 +1096,47 @@ fn two_bone(
     } else {
         thigh_rotation * Vec3::NEG_Y
     };
-    let min_reach = (thigh - calf).abs() + margin;
-    let max_reach = (thigh + calf - margin).max(min_reach);
-    let reach = distance.clamp(min_reach, max_reach);
+    // No margin at full extension: one forces a visible bend on every locked
+    // straight leg. A positive lower bound protects the division below.
+    let max_reach = thigh + calf;
+    // The margin is bounded so an absurd configured value cannot straighten a
+    // bent leg.
+    let margin = margin.min(0.25 * (max_reach - (thigh - calf).abs()));
+    let min_reach = ((thigh - calf).abs() + margin).max(1.0e-6).min(max_reach);
+    // Soft full extension, pinned to the measured leg: a target at the FK
+    // distance reproduces the FK reach exactly, and a straight FK leg has a
+    // smooth deadband instead of the square root's vertical tangent.
+    let fk_reach = fk_length.clamp(min_reach, max_reach);
+    let soft = |d: f32| d * d * d / (d * d + FULL_EXTENSION_SOFT_M * FULL_EXTENSION_SOFT_M);
+    let wanted = fk_reach + soft(max_reach - fk_reach) - soft((max_reach - distance).max(0.0));
+    // Measured-flexion guard: the knee's interior angle may differ from the
+    // sensed one by at most the slack; the rest of the request moves the ankle
+    // along the hip-target line instead of bending or straightening the knee.
+    let interior = |reach: f32| {
+        ((thigh * thigh + calf * calf - reach * reach) / (2.0 * thigh * calf))
+            .clamp(-1.0, 1.0)
+            .acos()
+    };
+    let reach_at = |angle: f32| {
+        (thigh * thigh + calf * calf - 2.0 * thigh * calf * angle.cos())
+            .max(0.0)
+            .sqrt()
+    };
+    let fk_interior = interior(fk_reach);
+    let shortest = reach_at((fk_interior - knee_flex_slack_rad).max(0.0)).min(fk_reach);
+    let longest =
+        reach_at((fk_interior + knee_flex_slack_rad).min(std::f32::consts::PI)).max(fk_reach);
+    // Blend the reach itself, not the slack angle: a few degrees of slack already
+    // free centimetres of reach, so widening the angle would act as a switch.
+    let free = wanted.clamp(min_reach, max_reach);
+    let guarded = free.clamp(shortest, longest).clamp(min_reach, max_reach);
+    let mut reach = free + (guarded - free) * flexion_guard.clamp(0.0, 1.0);
+    // The guard moves the ankle along the hip-target line; on a downward line a
+    // longer reach than the target's would carry it through the floor (seen for
+    // a crawling leg with a stale anchor). The floor outranks the knee angle.
+    if direction.y < -1.0e-3 && hip.y + direction.y * reach < min_ankle_y {
+        reach = ((min_ankle_y - hip.y) / direction.y).clamp(min_reach, reach);
+    }
     let ankle = hip + direction * reach;
     let along = (thigh * thigh - calf * calf + reach * reach) / (2.0 * reach);
     let height = (thigh * thigh - along * along).max(0.0).sqrt();

@@ -3,9 +3,9 @@
 How to run, calibrate and troubleshoot ChadFBT, and what each control does. For what the project is
 and how it differs from other trackers' software, see the [project README](../README.md).
 
-Everything here describes a research build. The estimator layers are verified by synthetic tests
-and a small number of worn sessions recorded in [VALIDATION.md](VALIDATION.md); none of it is a
-demonstrated accuracy improvement over any other software.
+Everything here describes a research build. The estimator layers are checked by synthetic tests
+and by replaying a small number of worn sessions recorded in [VALIDATION.md](VALIDATION.md); none
+of it is a demonstrated accuracy improvement over any other software.
 
 ## Run
 
@@ -42,31 +42,128 @@ For read-only integration diagnostics while SteamVR is already running, `chadfbt
 
 ## Estimator layers (experimental)
 
-The **Estimator · experimental** section below the 3D view switches each layer independently. All
-of them are verified by synthetic regressions only; none is a demonstrated accuracy result on a
-worn body, and every switch exists so a recording can be replayed with and without it. Design,
-equations and limits: [stance-anchored estimator](research/stance-anchored-estimator.md);
-synthetic results: [stance-heading-results](research/stance-heading-results.md).
+The **Estimator · experimental** section (below the 3D view, under the recovery and recording controls) has one switch
+per layer, plus the **Prediction lead** slider and the older **Experimental drift correction**
+checkbox. The layers are checked by synthetic regressions and replays only; none is a
+demonstrated accuracy result on a worn body. Switches are saved in the profile and cannot be
+changed during a calibration countdown or capture. Design, equations and limits:
+[stance-anchored estimator](research/stance-anchored-estimator.md); synthetic results:
+[stance-heading-results](research/stance-heading-results.md).
+
+What can be switched where:
+
+- **In the app:** each layer as a whole (the six checkboxes below), the prediction lead and the
+  legacy drift correction.
+- **Only when replaying a recording** (`--replay FILE --dump OUT --estimator JSON`, see
+  [Recordings and diagnostics](#recordings-and-diagnostics)): the parts inside a layer and their
+  tuning. For Contact-aware legs these are `leg_ik.root_correction_enabled`,
+  `foot_lock_enabled`, `flat_foot_enabled`, `support_floor_enabled` (pull-down) and
+  `floor_clamp_enabled` (raise below the floor). Three rules are ablated through their numbers:
+  the thigh part of the standing-floor rule by setting `support_thigh_full_tilt_rad` and
+  `support_thigh_zero_tilt_rad` to π or more, the squat rule by setting
+  `squat_bow_start_tilt_rad` and `squat_bow_full_tilt_rad` above π/2, and the measured
+  knee-angle guard by a large `knee_flex_slack_rad` (π). The stance filter's and the contact
+  detector's settings are under `stance` and `contact`.
+- **No switch at all:** the backward-lean rule (pull-down budget and lock limits), the fade-out
+  for gaps the budget cannot explain, and the soft full extension of the knee solve. The shin
+  part of the standing-floor rule shares its thresholds with the flat-foot rule and cannot be
+  changed separately from it.
 
 - **Stance heading filter.** While a foot is standing still, the IMU leg chain has to reproduce
   how the headset actually moved. The mismatch estimates each sensor's heading drift, including
   the whole-body drift that joint constraints cannot see. It needs a live headset and movement:
   a perfectly still user gets no correction. It cannot see a strap that rotated around the limb.
-- **Contact-aware legs.** A planted foot is held in place, the hips are shifted toward
-  consistency with it, the knee is re-solved so bone lengths stay exact, and planted feet are
-  kept flat. Foot contact is inferred, never measured.
+- **Contact-aware legs.** A foot guessed to be planted is locked horizontally, the hips are
+  shifted a bounded distance toward consistency with it, and the knee is re-solved so bone
+  lengths stay exact. A planted foot without a foot tracker is shown flat while its shin is near
+  upright. Foot contact and hip position are inferred, never measured.
+  - *Standing and squatting legs* (thigh and shin both near upright, or a folded thigh under a
+    torso bowed forward by more than about 20–35°): the support foot is assumed to be on the
+    floor. The hips and legs may be lowered to put it there, by an amount that grows when the
+    torso bows forward or sideways; a backward lean earns nothing. If the foot is further above
+    the floor than that amount can explain (a jump, a step, a stool), it is left where the model
+    puts it. A planted foot near the floor is held at floor height.
+  - *Seated and lying legs* (thigh beyond about 60–80° from vertical with an upright or reclined
+    torso, or shin beyond 40–60°): no floor assumption. The foot's height follows the body
+    model, so "locked" does not mean a fixed height, and the lock may not change the knee angle
+    the thigh and shin sensors measure by more than about 1°; beyond that the ankle slides
+    along the leg instead of the knee bending. With a backward-leaning or supine torso the lock
+    also lets go sooner, so a slowly moved leg is followed.
+  - A chair and a parallel squat fold the legs the same way. Only the forward bow of the torso
+    tells them apart, so leaning well forward on a seat is treated as a squat.
+  - Feet below the floor always raise the body, in any pose.
 - **Motion prediction.** Each sensor is extrapolated along its measured rotation rate to the
-  moment of solving. A silent tracker means "still", never "keep turning".
-- **Headset extrapolation** advances the headset position by its reported velocity over its age.
+  moment of solving. A silent tracker means "still", never "keep turning". Sudden stops can
+  overshoot briefly.
+- **Prediction lead** (0–30 ms, default 0; available while Motion prediction is on) predicts that
+  much further ahead than the solve time to hide part of the remaining output delay. Larger
+  leads overshoot more on sudden stops; 0 ms is the safest setting. The value is applied when
+  the slider is released.
+- **Headset extrapolation** advances the headset and controller positions by their reported
+  velocity over their age, at most 30 ms. Orientation is not extrapolated, and calibration gates
+  use the raw pose. It assumes SteamVR's velocity is current.
 - **Recenter-proof calibration.** A headset tracking jump (including a recenter reported by a
   SteamVR transform change) rotates the stored heading references instead of discarding
   calibration; a transform change without a headset jump changes nothing.
 - **Send angular velocity to SteamVR** is off by default: the frame SteamVR expects for that field
   is unverified. Linear velocity and pose age are always sent.
+- **Experimental drift correction** is the older knee-hinge heading adjustment described under
+  [Recovery and experimental correction](#recovery-and-experimental-correction). It is off by
+  default and does nothing while the stance heading filter is on.
 
 The Health page shows solve rate, packet-to-solve latency, per-sensor heading corrections with
 their uncertainty, contact states and foot locks. Those numbers describe the model's internal
 consistency, not tracking accuracy.
+
+### Sitting and lying down
+
+Sitting and lying have **not been validated on a worn body**. Low hips and raised legs were
+reported in both the app view and the avatar, including lying in bed. Mechanisms that produce
+such errors were reproduced on synthetic seated and lying poses and changed, and on those
+synthetic poses the output now stays close to the simulated body. Whether that fixes what you
+see is exactly what needs checking.
+
+What to expect:
+
+- The hips have no position sensor. Their height comes from the headset through a simple torso
+  model with fixed proportions. Nothing knows how high your chair or bed is. Slouching or
+  tilting the pelvis back while seated can leave the modelled hips a few centimetres low, and a
+  wrong split between torso and leg length, which standing does not reveal, shifts the seated
+  hips as well.
+- Seated and lying legs are shown as the sensors measure them. Feet are not pulled to the floor,
+  so seated feet that really are on the floor can float or sink a little when the body
+  proportions are off.
+- While sitting down or standing up, the hips can still be pulled down briefly: the thighs are
+  not yet level, or the torso leans forward as it does in a squat.
+- Leaning well forward on a seat (more than about 20–35°) is treated as a squat: the feet are
+  pulled to the floor again, which is wrong if they are off the floor or on a rung.
+- Lying on your side or face down is less protected than lying on your back: only the leg angles
+  keep the floor assumption away there.
+
+What **Contact-aware legs** does there: with it on, planted feet are still locked horizontally and
+the hips still shift slightly toward them, but the standing-floor assumption and any knee bending
+beyond the measured angle are off for those legs. With it off you see the plain chain from the
+headset down, with nothing locked.
+
+How to help validate:
+
+1. Calibrate standing as usual. Do not recalibrate while seated or lying to hide an offset.
+2. Start **Record session** before the calibration if you can, so the session can be replayed.
+3. Sit on a seat of known height with both feet flat on the floor and your back upright. Check
+   whether the hips sit at seat height, the thighs are level and the feet are on the floor.
+   Then lean back, and lean well forward, once with the feet on the floor and once lifted.
+4. Lie flat on your back with straight legs, on the floor if possible, then on a bed. Move your
+   head a little: the legs should stay flat and not lift at the knees. Move one leg slowly
+   sideways: the shown leg should follow. Try lying on your side as well.
+5. Do a deep squat with the feet flat: the feet should stay on the floor.
+6. In each pose, switch **Contact-aware legs** off and on without moving. A difference is the
+   contribution of this layer; no difference points at mounting, body proportions or the torso
+   model instead.
+7. Note the pose, the seat height and what you saw. Recordings stay local; see
+   [Recordings and diagnostics](#recordings-and-diagnostics).
+
+Background, mechanisms and open questions:
+[seated and lying investigation](research/seated-ik-investigation.md).
 
 ## Recovery and experimental correction
 
@@ -109,9 +206,43 @@ Developer commands:
 cargo test --workspace
 cargo run -p chadfbt -- --headless --seconds 30
 cargo run -p chadfbt -- --replay C:\path\to\session.jsonl
+cargo run -p chadfbt -- --replay C:\path\to\session.jsonl --dump C:\path\to\out.jsonl --every 10
 cargo run -p chadfbt -- --analyze-heading C:\path\to\session.jsonl --report C:\path\to\new-heading-report.json
 cargo run --release -p tracking-core --example benchmark
 ```
+
+`--headless --seconds N` (1–3600, default 30) runs the tracking worker without a window and prints
+a snapshot as JSON. `--replay FILE` alone replays a recording without any network output.
+
+`--replay FILE --dump OUT.jsonl` re-solves the recorded inputs with the current code and writes the
+solved frames (joints, segments, targets, estimator diagnostics). Its output is what the model
+computes from real inputs; it has no ground truth and is not an accuracy measurement. Options:
+
+- `--every N` writes every N-th solved frame (default 1).
+- `--estimator JSON` or `--estimator @FILE` merges a JSON object into the recorded estimator
+  configuration before it is applied, for example a file containing
+  `{"leg_ik": {"support_floor_enabled": false}}` or `{"enable_leg_ik": false}`. Top-level keys
+  are `enable_prediction`, `prediction_lead_secs`, `enable_hmd_extrapolation`,
+  `enable_auto_rebase`, `enable_stance_heading`, `enable_leg_ik`, and the `contact`, `stance`
+  and `leg_ik` groups. Invalid values are rejected. This is the only way to switch the parts
+  inside a layer.
+- `--raw-dimensions` keeps the recorded body dimensions instead of applying the chest-to-hip
+  normalisation the app applies when it loads a profile.
+
+Scripts in `tools/`:
+
+- `build.ps1` builds the driver, helper and the release application (`-DebugBuild` for a debug
+  build); release builds remap source paths so the binary does not contain the builder's
+  directory names.
+- `package.ps1` assembles the portable bundle in `dist\ChadFBT` with documentation, dependency
+  licenses and checksums (needs Python for the license step).
+- `collect-licenses.py` copies dependency license texts from Cargo's local sources; called by
+  `package.ps1`.
+- `probe-trackers.py` is a bounded, LAN-only receiver that captures tracker datagrams to
+  `local-data` without changing tracker configuration; close other tracker servers first.
+- `analyze-wire.py` summarises such a capture (packet types, firmware names) without printing
+  addresses or tracker identifiers.
+- `capture-window.ps1` saves a screenshot of the running ChadFBT window for UI checks.
 
 `--analyze-heading` streams an existing JSONL recording into the offline relative-heading shadow estimator before starting any single-instance service, tracker receiver or VR output. The report must be a **new file**; an existing file is never overwritten. The reader bounds line size and record count, and the JSON report is limited to 256 KiB. Malformed or incompatible input returns an error without creating a report. Missing original measurement timestamps in older recordings are excluded rather than treated as fresh data.
 
@@ -137,7 +268,7 @@ The release build statically links the Rust application's C runtime. The portabl
 | `crates/tracker-protocol` | Original bounded firmware-wire parser and response encoders |
 | `crates/tracking-core` | Calibration, shared kinematic chain, contact hypotheses, stance heading filter, leg IK, prediction, recovery, research shadow estimators, tests |
 | `crates/steamvr-bridge` | Versioned local IPC and validation |
-| `crates/chadfbt-app` | Network worker, recording/replay, profiles, OSC and native UI |
+| `crates/chadfbt-app` | Network worker, calibration flows, tracker identification, tap gestures, voice prompts, output modes, recording/replay/analysis, profiles, OSC and native UI |
 | `driver` | Original OpenVR driver/helper, build, registration, pinned upstream SDK |
 | `docs/research` | Source-backed comparison and integration research |
 

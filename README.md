@@ -48,7 +48,7 @@ tracker's heading has drifted.
  (absolute)                             │
                                         ├─► contact: which foot is standing still?
                                         ├─► heading filter: head displacement vs. leg chain
-                                        ├─► leg IK: support foot on the floor, feet locked
+                                        ├─► leg IK: standing-floor prior, horizontal foot locks
                                         ▼
                              tracker poses + velocities ──► SteamVR / VRChat
 ```
@@ -67,9 +67,17 @@ tracker's heading has drifted.
    error, with an uncertainty. Because the headset is absolute, this sees drift of the whole
    body, which joint-to-joint constraints cannot. Only changes in the chain carry information,
    so standing still or turning the head cannot move the estimate.
-5. **Contact-consistent legs.** The supporting foot is kept on the floor and the hips follow from
-   the legs; a bending spine absorbs the difference instead of lifting the feet. Planted feet
-   are locked in place and kept flat, and bone lengths stay exact.
+5. **Contact-consistent legs.** A foot hypothesised to be planted is locked horizontally, the
+   pelvis is shifted a bounded distance toward consistency with it, and the knee is re-solved
+   with fixed bone lengths. A standing-floor prior applies only to a leg whose thigh and shin
+   are both near upright: it may lower the pelvis and legs so the support foot rests on the
+   floor, within a budget that grows when the torso bows forward or sideways and that fades out
+   when the gap is too large for that budget to explain (a jump, a step, a stool, a bed). A
+   squat keeps the prior through its forward-bowed torso. Legs that are folded under an upright
+   or reclined torso (seated, lying) lose it: their height follows the body model and a foot
+   lock may not change the knee angle the thigh and shin sensors measure by more than about a
+   degree. Feet below the floor always raise the body. Pelvis position remains
+   inferred; chair and bed support are not measured or modelled.
 6. **Timing.** Packets are time-stamped on arrival, the solver runs when data arrives, each
    tracker is extrapolated to the moment of solving, and poses are sent to SteamVR with
    velocities so it can predict to display time.
@@ -91,8 +99,8 @@ them produces better tracking is an open question.
 | Heading drift | Nudged toward a relaxed-pose template at a fixed rate (Stay Aligned, off by default), plus manual resets | Estimated per tracker, with uncertainty, from headset displacement during stance |
 | Whole-body drift | Not observable without a reset | Observable whenever the body moves over a planted foot |
 | Headset position | Root of the skeleton only | Root of the skeleton and heading evidence |
-| Planted feet | Position-only correction that can stretch the leg; off when the hips are low | Support foot on the floor, hips corrected, exact bone lengths, any posture |
-| Feet without foot trackers | Rotate with the shin | Flat while planted |
+| Planted feet | Position-only correction that can stretch the leg; off when the hips are low | Horizontal lock, bounded pelvis correction, fixed bone lengths; floor support assumed only for upright legs; seated/lying support is not modelled |
+| Feet without foot trackers | Rotate with the shin | Flat while planted with the shin near upright |
 | Calibration | Held I-pose and ski pose (a step-based method is in progress upstream) | Stand, then any forward-bending movement; ski pose kept as a fallback |
 | Latency handling | No pose age sent; velocity off by default | Arrival timestamps, extrapolation to solve time, velocity and pose age sent |
 | Scope | Many tracker counts, boards, platforms and languages | Windows, SteamVR, one six-tracker layout |
@@ -108,7 +116,16 @@ capture; the combination used here is described, with its prior art, in the
 - Contact is a guess. A foot sliding slowly can be mistaken for a planted one.
 - Torso heading is only weakly observed when you stand upright.
 - A strap that rotates around the limb changes mounting, not heading, and needs recalibration.
-- Sitting, kneeling and lying are handled conservatively and less well than standing.
+- Sitting, kneeling and lying are outside what has been validated. Low hips and raised legs
+  were reported in both the app view and the avatar, including lying in bed. Mechanisms that
+  produce such errors were reproduced on synthetic poses and changed (a forced knee bend on
+  locked straight legs, floor pull-down of seated legs, foot locks overriding the measured knee
+  angle), but none of the changes has been checked on a worn body, and nothing models a seat or
+  a bed. A chair and a parallel squat look the same to the leg sensors; they are told apart only
+  by a forward-bowed torso, so leaning well forward on a seat with the feet off the floor is
+  treated as a squat and pulled down, and genuinely grounded seated feet can float when the
+  body model is wrong.
+  [Seated and lying investigation](docs/research/seated-ik-investigation.md).
 - Feet have no trackers by default, so ankle movement is inferred.
 
 ## Getting started
@@ -163,6 +180,8 @@ recording and replay, and troubleshooting.
 - [SlimeVR source review](docs/research/slimevr-internals.md) and
   [literature review](docs/research/literature-review.md)
 - [Estimator core reference](crates/tracking-core/README.md)
+- [Seated and lying IK investigation](docs/research/seated-ik-investigation.md): synthetic
+  mechanisms, what was changed, known limits and the pending worn validation
 
 ## Status and evidence
 
@@ -172,7 +191,8 @@ recording and replay, and troubleshooting.
 - **Worn sessions:** a small number, by one person, recorded in the
   [validation record](docs/VALIDATION.md). They found real defects (legs lifting during bends, a
   false chest heading correction, a phantom tracker), which were fixed and checked by replaying
-  the recorded session.
+  the recorded session. The later seated and lying changes rest on synthetic reproduction and
+  one replayed seated segment; they have not been worn.
 - **Not done:** any comparison against SlimeVR, any optical or camera reference, more than one
   body, long sessions, other tracker hardware or firmware versions.
 
@@ -189,7 +209,7 @@ under those rules, directed and tested by a human on real hardware.
 ```powershell
 cargo test --workspace
 cargo run --release -p tracking-core --example stance_heading
-cargo run -p chadfbt -- --replay <recording.jsonl> --dump <out.jsonl>
+cargo run -p chadfbt -- --replay <recording.jsonl> --dump <out.jsonl> [--every N] [--estimator JSON|@FILE]
 ```
 
 Recordings and anything else captured from a real session stay in the gitignored `local-data`

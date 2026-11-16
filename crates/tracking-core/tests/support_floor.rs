@@ -45,6 +45,7 @@ fn floor_input(
             Vec3::new(-0.1, ankle_y[0], 0.0),
             Vec3::new(0.1, ankle_y[1], 0.0),
         ],
+        thigh_rotations: [Quat::IDENTITY; 2],
         calf_rotations: [pitch(-shank_degrees); 2],
         chest_rotation: pitch(torso_degrees),
         spine_rotation: pitch(torso_degrees),
@@ -81,6 +82,35 @@ fn torso_flexion_terms_follow_the_chain_geometry() {
     let expected_h = 0.2 * 72f32.to_radians().sin() + 0.38 * 66f32.to_radians().sin();
     assert!((bow.vertical_m - expected_v).abs() < 1.0e-5);
     assert!((bow.horizontal_m - expected_h).abs() < 1.0e-5);
+    // A forward (or sideways) bow keeps both terms in full as "bow" terms.
+    assert!((bow.bow_vertical_m - expected_v).abs() < 1.0e-5);
+    assert!((bow.bow_horizontal_m - expected_h).abs() < 1.0e-5);
+    let side = TorsoFlexion::new(
+        Quat::from_rotation_z(72f32.to_radians()),
+        Quat::from_rotation_z(-66f32.to_radians()),
+        0.2,
+        0.38,
+    );
+    assert!((side.bow_vertical_m - expected_v).abs() < 1.0e-5);
+    assert!((side.bow_horizontal_m - expected_h).abs() < 1.0e-5);
+    // The same tilts backward: the geometry is unchanged, the bow terms vanish.
+    let recline = TorsoFlexion::new(pitch(-72.0), pitch(-66.0), 0.2, 0.38);
+    assert!((recline.vertical_m - expected_v).abs() < 1.0e-5);
+    assert!((recline.horizontal_m - expected_h).abs() < 1.0e-5);
+    assert!(recline.bow_vertical_m.abs() < 1.0e-6 && recline.bow_horizontal_m.abs() < 1.0e-6);
+    // Per segment: chest reclined, spine bowed keeps the spine terms only.
+    let mixed = TorsoFlexion::new(pitch(-72.0), pitch(66.0), 0.2, 0.38);
+    assert!((mixed.bow_vertical_m - 0.38 * (1.0 - 66f32.to_radians().cos())).abs() < 1.0e-5);
+    assert!((mixed.bow_horizontal_m - 0.38 * 66f32.to_radians().sin()).abs() < 1.0e-5);
+    // Halfway between backward and sideways the fade is linear in the upward
+    // component of the forward axis: 1 − 1/sqrt(2) of each term is left.
+    let diagonal = Quat::from_axis_angle(Vec3::new(1.0, 0.0, 1.0).normalize(), 50f32.to_radians());
+    let partial = TorsoFlexion::new(diagonal, diagonal, 0.2, 0.38);
+    let left = 1.0 - std::f32::consts::FRAC_1_SQRT_2;
+    assert!((partial.bow_horizontal_m - 0.58 * 50f32.to_radians().sin() * left).abs() < 1.0e-5);
+    assert!(
+        (partial.bow_vertical_m - 0.58 * (1.0 - 50f32.to_radians().cos()) * left).abs() < 1.0e-5
+    );
     let broken = TorsoFlexion::new(
         Quat::from_xyzw(f32::NAN, 0.0, 0.0, 1.0),
         Quat::IDENTITY,
@@ -88,6 +118,7 @@ fn torso_flexion_terms_follow_the_chain_geometry() {
         0.38,
     );
     assert!(broken.vertical_m.is_finite() && broken.horizontal_m.is_finite());
+    assert!(broken.bow_vertical_m.is_finite() && broken.bow_horizontal_m.is_finite());
 }
 
 #[test]
@@ -101,8 +132,18 @@ fn upright_torso_gets_only_the_base_budget_so_a_lifted_body_still_lifts() {
         1.0,
     );
     assert!((out.budget_m - 0.02).abs() < 1.0e-6, "{out:?}");
-    assert!((out.vertical_m + 0.02).abs() < 1.0e-4, "{out:?}");
+    // A 20 cm gap is far beyond what a 2 cm budget can explain: no pull at all.
+    assert_eq!(out.vertical_m, 0.0, "{out:?}");
     assert!(out.limited && !out.raised);
+    // A gap the budget does explain is still closed in full.
+    let mut near = SupportFloor::new(LegIkConfig::default());
+    let out = settle(
+        &mut near,
+        floor_input(0.0, [SOLE + 0.015; 2], 0.0, 0.0),
+        0.0,
+        1.0,
+    );
+    assert!((out.vertical_m + 0.015).abs() < 1.0e-4, "{out:?}");
     // A knee lift: the support foot is on the floor, the lifted one is not pulled down.
     let out = settle(
         &mut floor,
@@ -170,6 +211,628 @@ fn kneeling_sitting_and_lying_on_the_floor_are_left_alone() {
     );
     assert!((out.support_weight - 0.5).abs() < 1.0e-3, "{out:?}");
     assert!((out.vertical_m + 0.05).abs() < 1.0e-3, "{out:?}");
+}
+
+/// Torso lean (degrees forward) and support-foot gap for tests of the thigh
+/// taper alone: the lean stays below `squat_bow_start_tilt_rad` (20°), where a
+/// forward-bowed torso would hand a folded thigh the standing prior back, and
+/// the gap stays inside the budget of that lean, 2 cm + 0.58 m·(1 − cos 15°) =
+/// 4.0 cm.
+const THIGH_TAPER_LEAN: f32 = 15.0;
+const THIGH_TAPER_GAP: f32 = 0.03;
+
+#[test]
+fn floor_pull_fades_smoothly_for_folded_thighs_and_keeps_the_below_floor_guard() {
+    for (degrees, expected_weight) in [
+        (0.0, 1.0),
+        (60.0, 1.0),
+        (70.0, 0.5),
+        (80.0, 0.0),
+        (90.0, 0.0),
+    ] {
+        let mut floor = SupportFloor::new(LegIkConfig::default());
+        let mut input = floor_input(0.0, [SOLE + THIGH_TAPER_GAP; 2], THIGH_TAPER_LEAN, 0.0);
+        input.thigh_rotations = [pitch(degrees); 2];
+        let out = settle(&mut floor, input, 0.0, 1.0);
+        assert!(out.budget_m > THIGH_TAPER_GAP, "{out:?}");
+        assert!(
+            (out.support_weight - expected_weight).abs() < 0.001,
+            "{degrees}: {out:?}"
+        );
+        assert!(
+            (out.vertical_m + THIGH_TAPER_GAP * expected_weight).abs() < 0.0003,
+            "{degrees}: {out:?}"
+        );
+    }
+    let mut floor = SupportFloor::new(LegIkConfig::default());
+    let mut input = floor_input(0.0, [SOLE - 0.08; 2], 0.0, 0.0);
+    input.thigh_rotations = [pitch(90.0); 2];
+    let out = floor.update(&input);
+    assert!(out.raised && out.vertical_m > 0.06, "{out:?}");
+    input.thigh_rotations = [Quat::from_xyzw(f32::NAN, 0.0, 0.0, 1.0); 2];
+    input.ankles[0].y = SOLE + 0.10;
+    input.ankles[1].y = SOLE + 0.10;
+    let mut floor = SupportFloor::new(LegIkConfig::default());
+    let out = settle(&mut floor, input, 0.0, 1.0);
+    assert_eq!(out.support_weight, 0.0);
+    assert_eq!(out.vertical_m, 0.0);
+}
+
+#[test]
+fn folded_support_releases_previous_pull_and_an_upright_leg_gets_it_back() {
+    let mut floor = SupportFloor::new(LegIkConfig::default());
+    let mut input = floor_input(0.0, [SOLE + 0.035; 2], THIGH_TAPER_LEAN, 0.0);
+    let upright = settle(&mut floor, input, 0.0, 1.0);
+    assert!((upright.vertical_m + 0.035).abs() < 1.0e-4, "{upright:?}");
+    // Folding the thighs releases the pull although the gap is unchanged.
+    input.thigh_rotations = [pitch(90.0); 2];
+    let folded = settle(&mut floor, input, 1.01, 1.0);
+    assert_eq!(folded.vertical_m, 0.0, "{folded:?}");
+    assert!((folded.gap_m - 0.035).abs() < 1.0e-6 && folded.limited);
+    // A smaller gap is not pulled closed either while the thighs are folded...
+    input.ankles = input.ankles.map(|p| Vec3::new(p.x, SOLE + 0.02, p.z));
+    let folded_near = settle(&mut floor, input, 2.02, 1.0);
+    assert_eq!(folded_near.vertical_m, 0.0, "{folded_near:?}");
+    // ...and the same gap is closed again once they are upright: the gate
+    // follows the pose, it does not latch.
+    input.thigh_rotations = [Quat::IDENTITY; 2];
+    let restored = settle(&mut floor, input, 3.03, 1.0);
+    assert!((restored.vertical_m + 0.02).abs() < 1.0e-4, "{restored:?}");
+    assert_eq!(restored.support_weight, 1.0);
+    // With the feet on the floor the stored pull decays instead of sticking.
+    input.ankles = input.ankles.map(|p| Vec3::new(p.x, SOLE, p.z));
+    let grounded = settle(&mut floor, input, 4.04, 1.0);
+    assert!(grounded.vertical_m.abs() < 1.0e-5, "{grounded:?}");
+}
+
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// The documented pull-down for a support foot `gap` above the floor: the gap,
+/// capped by the budget, scaled by the upright-leg weight and faded out between
+/// a gap of one budget and of two budgets plus 5 cm.
+fn documented_pull(gap: f32, budget: f32, weight: f32) -> f32 {
+    gap.max(0.0).min(budget) * weight * (1.0 - smoothstep(budget, 2.0 * budget + 0.05, gap))
+}
+
+#[test]
+fn a_backward_recline_earns_no_pull_down_budget_while_a_forward_or_sideways_tilt_does() {
+    let base = LegIkConfig::default().support_floor_base_m;
+    let torso = NECK_TO_CHEST + CHEST_TO_HIP;
+    for degrees in [30.0_f32, 55.0, 90.0] {
+        let slack = torso * (1.0 - degrees.to_radians().cos());
+        let forward = pitch(degrees);
+        let backward = pitch(-degrees);
+        // Both sideways directions, and a forward lean seen from another heading.
+        let sideways = [
+            Quat::from_rotation_z(degrees.to_radians()),
+            Quat::from_rotation_z(-degrees.to_radians()),
+            Quat::from_rotation_y(1.1) * forward,
+        ];
+        let flexion = |q: Quat| TorsoFlexion::new(q, q, NECK_TO_CHEST, CHEST_TO_HIP);
+        // The direction only matters for the pull-down budget: the height the
+        // torso spans and its horizontal reach are the same either way.
+        assert!((flexion(forward).vertical_m - slack).abs() < 1.0e-5);
+        assert!((flexion(backward).vertical_m - slack).abs() < 1.0e-5);
+        assert!((flexion(backward).horizontal_m - flexion(forward).horizontal_m).abs() < 1.0e-5);
+        assert!((flexion(forward).bow_vertical_m - slack).abs() < 1.0e-5);
+        assert!(flexion(backward).bow_vertical_m.abs() < 1.0e-6);
+        // A recline seen from another heading is still a recline.
+        let turned = flexion(Quat::from_rotation_y(-2.3) * backward);
+        assert!(turned.bow_vertical_m.abs() < 1.0e-5, "{turned:?}");
+        for q in sideways {
+            assert!((flexion(q).bow_vertical_m - slack).abs() < 1.0e-5, "{q:?}");
+        }
+        // Halfway between backward and sideways: the forward axis points up by
+        // sin(tilt)/sqrt(2), so 1 − 1/sqrt(2) of the term is left.
+        let diagonal =
+            Quat::from_axis_angle(Vec3::new(1.0, 0.0, 1.0).normalize(), degrees.to_radians());
+        let partial = slack * (1.0 - std::f32::consts::FRAC_1_SQRT_2);
+        assert!((flexion(diagonal).bow_vertical_m - partial).abs() < 1.0e-5);
+        // Chest reclined, lower spine bowed: only the bowed segment counts.
+        let mixed = TorsoFlexion::new(backward, forward, NECK_TO_CHEST, CHEST_TO_HIP);
+        let spine_only = CHEST_TO_HIP * (1.0 - degrees.to_radians().cos());
+        assert!((mixed.bow_vertical_m - spine_only).abs() < 1.0e-5);
+
+        // Through SupportFloor, with upright legs and a gap of 95 % of what the
+        // forward budget covers (9.3, 25.4 and 57 cm; the pelvis is put high
+        // enough for its height guard to stay out of the way).
+        let gap = 0.95 * (base + slack);
+        let run = |rotation: Quat| {
+            let mut input = floor_input(0.0, [SOLE + gap; 2], 0.0, 0.0);
+            input.hip.y = 1.2;
+            input.chest_rotation = rotation;
+            input.spine_rotation = rotation;
+            settle(
+                &mut SupportFloor::new(LegIkConfig::default()),
+                input,
+                0.0,
+                1.0,
+            )
+        };
+        let bowed = run(forward);
+        assert!(
+            (bowed.budget_m - (base + slack)).abs() < 1.0e-5,
+            "{bowed:?}"
+        );
+        assert!(
+            (bowed.vertical_m + gap).abs() < 1.0e-4,
+            "{degrees}: {bowed:?}"
+        );
+        for q in sideways {
+            let leaned = run(q);
+            assert!(
+                (leaned.vertical_m + gap).abs() < 1.0e-4,
+                "{degrees}: {leaned:?}"
+            );
+        }
+        let reclined = run(backward);
+        assert_eq!(reclined.support_weight, 1.0);
+        assert!((reclined.budget_m - base).abs() < 1.0e-6, "{reclined:?}");
+        // Every one of these gaps is beyond 2·2 cm + 5 cm: no pull at all,
+        // where the same tilt forward lowers the body by the whole gap.
+        assert!(gap > 2.0 * base + 0.05);
+        assert_eq!(reclined.vertical_m, 0.0, "{degrees}: {reclined:?}");
+        assert!(reclined.limited);
+        // A gap the upright base budget explains is still closed when reclined.
+        let mut near = floor_input(0.0, [SOLE + 0.015; 2], 0.0, 0.0);
+        near.chest_rotation = backward;
+        near.spine_rotation = backward;
+        let near = settle(
+            &mut SupportFloor::new(LegIkConfig::default()),
+            near,
+            0.0,
+            1.0,
+        );
+        assert!((near.vertical_m + 0.015).abs() < 1.0e-4, "{near:?}");
+    }
+}
+
+#[test]
+fn the_pull_fades_out_for_a_gap_the_budget_cannot_explain() {
+    // A 40° bow: budget 2 cm + 0.58 m·(1 − cos 40°) = 15.6 cm. The pull closes a
+    // gap up to the budget, then fades to nothing at 2·15.6 + 5 = 36.1 cm.
+    let budget = 0.02 + (NECK_TO_CHEST + CHEST_TO_HIP) * (1.0 - 40.0_f32.to_radians().cos());
+    let end = 2.0 * budget + 0.05;
+    let pull_for = |gap: f32| {
+        let out = settle(
+            &mut SupportFloor::new(LegIkConfig::default()),
+            floor_input(0.0, [SOLE + gap; 2], 40.0, 0.0),
+            0.0,
+            1.0,
+        );
+        assert!((out.budget_m - budget).abs() < 1.0e-5, "{out:?}");
+        assert!((out.gap_m - gap).abs() < 1.0e-5, "{out:?}");
+        -out.vertical_m
+    };
+    let steps = 40;
+    // Pull at the previous gap beyond the budget.
+    let mut previous = f32::INFINITY;
+    let mut largest = 0.0_f32;
+    for k in 1..=steps {
+        let gap = (end + 0.04) * k as f32 / steps as f32;
+        let pull = pull_for(gap);
+        assert!(
+            (pull - documented_pull(gap, budget, 1.0)).abs() < 1.0e-4,
+            "gap {gap}: pull {pull}"
+        );
+        largest = largest.max(pull);
+        if gap <= budget {
+            assert!((pull - gap).abs() < 1.0e-4, "gap {gap}: pull {pull}");
+        } else {
+            // Never more than the budget, never growing with the gap again.
+            assert!(pull <= budget + 1.0e-5, "gap {gap}: pull {pull}");
+            assert!(
+                pull <= previous + 1.0e-5,
+                "gap {gap}: {pull} after {previous}"
+            );
+            previous = pull;
+        }
+        if gap >= end {
+            assert_eq!(pull, 0.0, "gap {gap}");
+        }
+    }
+    assert!(
+        largest > budget - 0.01,
+        "the sweep reaches the budget: {largest}"
+    );
+    // The pull is continuous at the budget and half of it is left midway.
+    assert!((pull_for(budget) - budget).abs() < 1.0e-4);
+    assert!((pull_for(budget + 0.002) - budget).abs() < 1.0e-3);
+    assert!((pull_for(0.5 * (budget + end)) - 0.5 * budget).abs() < 1.0e-4);
+    assert_eq!(pull_for(end), 0.0);
+}
+
+#[test]
+fn thigh_sweep_with_a_slight_forward_lean_documents_the_residual_pull_between_60_and_80_degrees() {
+    // A 15° forward lean (too little for the squat rule) gives a 4.0 cm budget;
+    // the support ankle reads 3 cm above the floor with a vertical shank. The
+    // pull is 3 cm times the thigh weight 1 − smoothstep(60°, 80°, tilt): a
+    // perched or half-reclined seat (thighs 60–75° from vertical) is still
+    // pulled toward the floor.
+    let gap = THIGH_TAPER_GAP;
+    let run = |thigh: Quat| {
+        let mut input = floor_input(0.0, [SOLE + gap; 2], THIGH_TAPER_LEAN, 0.0);
+        input.thigh_rotations = [thigh; 2];
+        settle(
+            &mut SupportFloor::new(LegIkConfig::default()),
+            input,
+            0.0,
+            1.0,
+        )
+    };
+    let mut previous = f32::INFINITY;
+    for (degrees, expected_pull) in [
+        (55.0_f32, 0.03_f32),
+        (60.0, 0.03),
+        (65.0, 0.025_312_5),
+        (70.0, 0.015),
+        (75.0, 0.004_687_5),
+        (80.0, 0.0),
+        (85.0, 0.0),
+        (90.0, 0.0),
+        (130.0, 0.0),
+        (175.0, 0.0),
+    ] {
+        let weight = 1.0 - smoothstep(60.0, 80.0, degrees);
+        assert!((gap * weight - expected_pull).abs() < 1.0e-6);
+        // The gate looks at the tilt only: knee forward, backward or sideways.
+        for thigh in [
+            pitch(degrees),
+            pitch(-degrees),
+            Quat::from_rotation_z(degrees.to_radians()),
+        ] {
+            let out = run(thigh);
+            assert!(out.budget_m > gap, "{out:?}");
+            assert!(
+                (out.support_weight - weight).abs() < 1.0e-3,
+                "{degrees}: {out:?}"
+            );
+            assert!(
+                (out.vertical_m + expected_pull).abs() < 2.0e-4,
+                "thigh {degrees}°: pulled {} m, documented {expected_pull}",
+                -out.vertical_m
+            );
+        }
+        let pull = -run(pitch(degrees)).vertical_m;
+        assert!(
+            pull <= previous + 1.0e-6,
+            "{degrees}: {pull} after {previous}"
+        );
+        if degrees >= 80.0 {
+            assert_eq!(pull, 0.0, "{degrees}");
+        }
+        previous = pull;
+    }
+}
+
+#[test]
+fn thigh_thresholds_at_or_above_pi_restore_the_calf_only_gate() {
+    let pi = std::f32::consts::PI;
+    for threshold in [pi, 4.0] {
+        let ablated = LegIkConfig {
+            support_thigh_full_tilt_rad: threshold,
+            support_thigh_zero_tilt_rad: threshold,
+            ..LegIkConfig::default()
+        };
+        // Sanitising keeps the ablation.
+        assert_eq!(ablated.sanitized(), ablated);
+        for thigh_degrees in [0.0_f32, 70.0, 90.0, 130.0, 170.0] {
+            for (shank_degrees, calf_weight) in [(0.0_f32, 1.0_f32), (50.0, 0.5), (90.0, 0.0)] {
+                let mut input = floor_input(
+                    0.0,
+                    [SOLE + THIGH_TAPER_GAP; 2],
+                    THIGH_TAPER_LEAN,
+                    shank_degrees,
+                );
+                input.thigh_rotations = [pitch(thigh_degrees); 2];
+                let calf_only = settle(&mut SupportFloor::new(ablated), input, 0.0, 1.0);
+                assert!(
+                    (calf_only.support_weight - calf_weight).abs() < 1.0e-3,
+                    "threshold {threshold}, thigh {thigh_degrees}: {calf_only:?}"
+                );
+                assert!(
+                    (calf_only.vertical_m + THIGH_TAPER_GAP * calf_weight).abs() < 3.0e-4,
+                    "threshold {threshold}, thigh {thigh_degrees}: {calf_only:?}"
+                );
+                // The default gate is what removes the pull for a folded thigh.
+                let gated = settle(
+                    &mut SupportFloor::new(LegIkConfig::default()),
+                    input,
+                    0.0,
+                    1.0,
+                );
+                if thigh_degrees >= 80.0 {
+                    assert_eq!(gated.vertical_m, 0.0, "thigh {thigh_degrees}: {gated:?}");
+                } else if thigh_degrees <= 60.0 {
+                    assert!((gated.vertical_m - calf_only.vertical_m).abs() < 1.0e-5);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn sanitized_repairs_bad_thigh_thresholds_and_knee_flex_slack() {
+    let d = LegIkConfig::default();
+    assert_eq!(d.sanitized(), d);
+    assert!((d.support_thigh_full_tilt_rad - 60.0_f32.to_radians()).abs() < 1.0e-6);
+    assert!((d.support_thigh_zero_tilt_rad - 80.0_f32.to_radians()).abs() < 1.0e-6);
+    assert!(d.knee_flex_slack_rad > 0.0 && d.knee_flex_slack_rad < 5.0_f32.to_radians());
+    let thresholds = |full: f32, zero: f32| {
+        let c = LegIkConfig {
+            support_thigh_full_tilt_rad: full,
+            support_thigh_zero_tilt_rad: zero,
+            ..d
+        }
+        .sanitized();
+        // Nothing else changes, and the result is a fixed point.
+        assert_eq!(
+            LegIkConfig {
+                support_thigh_full_tilt_rad: d.support_thigh_full_tilt_rad,
+                support_thigh_zero_tilt_rad: d.support_thigh_zero_tilt_rad,
+                ..c
+            },
+            d
+        );
+        assert_eq!(c.sanitized(), c);
+        (c.support_thigh_full_tilt_rad, c.support_thigh_zero_tilt_rad)
+    };
+    let defaults = (d.support_thigh_full_tilt_rad, d.support_thigh_zero_tilt_rad);
+    for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.2] {
+        assert_eq!(
+            thresholds(bad, d.support_thigh_zero_tilt_rad),
+            defaults,
+            "{bad}"
+        );
+        assert_eq!(
+            thresholds(d.support_thigh_full_tilt_rad, bad),
+            defaults,
+            "{bad}"
+        );
+        assert_eq!(thresholds(bad, bad), defaults, "{bad}");
+        // A valid partner that the repaired value would invert: both reset.
+        assert_eq!(thresholds(bad, 0.5), defaults, "{bad}");
+        assert_eq!(thresholds(1.5, bad), defaults, "{bad}");
+    }
+    // Inverted (zero weight before full weight): both reset.
+    assert_eq!(thresholds(1.4, 0.5), defaults);
+    // Valid values are kept, including a hard step and the ablation.
+    assert_eq!(thresholds(0.5, 0.9), (0.5, 0.9));
+    assert_eq!(thresholds(1.0, 1.0), (1.0, 1.0));
+    assert_eq!(thresholds(4.0, 4.0), (4.0, 4.0));
+
+    let slack = |value: f32| {
+        let c = LegIkConfig {
+            knee_flex_slack_rad: value,
+            ..d
+        }
+        .sanitized();
+        assert_eq!(
+            LegIkConfig {
+                knee_flex_slack_rad: d.knee_flex_slack_rad,
+                ..c
+            },
+            d
+        );
+        c.knee_flex_slack_rad
+    };
+    for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.01] {
+        assert_eq!(slack(bad), d.knee_flex_slack_rad, "{bad}");
+    }
+    for good in [0.0, 0.1, std::f32::consts::PI] {
+        assert_eq!(slack(good), good);
+    }
+    // A repaired configuration behaves like the default one.
+    let repaired = LegIkConfig {
+        support_thigh_full_tilt_rad: f32::NAN,
+        support_thigh_zero_tilt_rad: -1.0,
+        knee_flex_slack_rad: f32::NAN,
+        ..d
+    };
+    let mut input = floor_input(0.0, [SOLE + THIGH_TAPER_GAP; 2], THIGH_TAPER_LEAN, 0.0);
+    input.thigh_rotations = [pitch(70.0); 2];
+    let out = settle(&mut SupportFloor::new(repaired), input, 0.0, 1.0);
+    assert!((out.support_weight - 0.5).abs() < 1.0e-3, "{out:?}");
+    assert!(
+        (out.vertical_m + 0.5 * THIGH_TAPER_GAP).abs() < 3.0e-4,
+        "{out:?}"
+    );
+}
+
+/// Folded thighs (90°) over upright shanks, 1.5 cm above the floor (inside the
+/// 2 cm base budget, so the pull is the gap times the upright-leg weight).
+fn folded_thigh_weight(config: LegIkConfig, chest: Quat, spine: Quat) -> SupportFloorDiagnostics {
+    let mut input = floor_input(0.0, [SOLE + 0.015; 2], 0.0, 0.0);
+    input.thigh_rotations = [pitch(90.0); 2];
+    input.chest_rotation = chest;
+    input.spine_rotation = spine;
+    let out = settle(&mut SupportFloor::new(config), input, 0.0, 1.0);
+    assert!(
+        (out.vertical_m + 0.015 * out.support_weight).abs() < 1.0e-4,
+        "{out:?}"
+    );
+    out
+}
+
+#[test]
+fn a_forward_bowed_spine_gives_folded_thighs_the_standing_prior_back() {
+    let d = LegIkConfig::default();
+    assert!((d.squat_bow_start_tilt_rad - 20.0_f32.to_radians()).abs() < 1.0e-6);
+    assert!((d.squat_bow_full_tilt_rad - 35.0_f32.to_radians()).abs() < 1.0e-6);
+    // Forward lean of the mid-spine in 1.25° steps: no weight up to 20°, all of
+    // it from 35°, smoothstep between. Its steepest slope is 1.5/15° = 0.1 per
+    // degree, so no 1.25° step may change the weight by more than 0.125.
+    let mut previous = 0.0_f32;
+    for step in 0..=72 {
+        let degrees = step as f32 * 1.25;
+        let out = folded_thigh_weight(d, pitch(degrees), pitch(degrees));
+        let expected = smoothstep(20.0, 35.0, degrees);
+        assert!(
+            (out.support_weight - expected).abs() < 2.0e-3,
+            "lean {degrees}°: {out:?}, expected weight {expected}"
+        );
+        if degrees <= 20.0 {
+            assert_eq!(out.vertical_m, 0.0, "lean {degrees}°: {out:?}");
+        }
+        if degrees >= 35.0 {
+            assert!((out.vertical_m + 0.015).abs() < 1.0e-4, "lean {degrees}°");
+        }
+        assert!(out.support_weight >= previous - 1.0e-4, "lean {degrees}°");
+        assert!(out.support_weight - previous < 0.13, "lean {degrees}°");
+        previous = out.support_weight;
+    }
+    for degrees in [10.0_f32, 25.0, 40.0, 60.0, 90.0] {
+        let radians = degrees.to_radians();
+        // Reclined or leaning sideways by any amount: a seat, not a squat.
+        for lean in [
+            pitch(-degrees),
+            Quat::from_rotation_z(radians),
+            Quat::from_rotation_z(-radians),
+            Quat::from_rotation_y(0.9) * pitch(-degrees),
+        ] {
+            let out = folded_thigh_weight(d, lean, lean);
+            assert_eq!(out.support_weight, 0.0, "{degrees}°: {out:?}");
+            assert_eq!(out.vertical_m, 0.0, "{degrees}°: {out:?}");
+        }
+        // The rule reads the mid-spine: a bowed chest over an upright spine
+        // does not count, a bowed spine under an upright chest does.
+        let chest_only = folded_thigh_weight(d, pitch(degrees), Quat::IDENTITY);
+        assert_eq!(chest_only.support_weight, 0.0, "{degrees}°");
+        let spine_only = folded_thigh_weight(d, Quat::IDENTITY, pitch(degrees));
+        assert!((spine_only.support_weight - smoothstep(20.0, 35.0, degrees)).abs() < 2.0e-3);
+        // Heading does not matter.
+        let turned = Quat::from_rotation_y(-2.1) * pitch(degrees);
+        let turned = folded_thigh_weight(d, turned, turned);
+        assert!((turned.support_weight - smoothstep(20.0, 35.0, degrees)).abs() < 2.0e-3);
+    }
+    // Folded past horizontal (head below the pelvis, or trackers over-reading a
+    // deep fold): the forward axis points less far down again, but this is
+    // still a full forward lean, not a shallow one.
+    for degrees in [90.0_f32, 100.0, 120.0, 145.0, 160.0, 175.0] {
+        let out = folded_thigh_weight(d, pitch(degrees), pitch(degrees));
+        assert_eq!(
+            out.support_weight, 1.0,
+            "folded {degrees}° forward: {out:?}"
+        );
+        let turned = Quat::from_rotation_y(2.4) * pitch(degrees);
+        let out = folded_thigh_weight(d, turned, turned);
+        assert_eq!(
+            out.support_weight, 1.0,
+            "folded {degrees}° forward: {out:?}"
+        );
+        // Bent backward or sideways past horizontal earns nothing.
+        for lean in [
+            pitch(-degrees),
+            Quat::from_rotation_y(2.4) * pitch(-degrees),
+            Quat::from_rotation_z(degrees.to_radians()),
+            Quat::from_rotation_z(-degrees.to_radians()),
+        ] {
+            let out = folded_thigh_weight(d, lean, lean);
+            assert_eq!(out.support_weight, 0.0, "{degrees}°: {out:?}");
+        }
+    }
+    // The shank gate still applies on top: kneeling under a bowed torso.
+    let mut kneeling = floor_input(0.0, [SOLE + 0.015; 2], 60.0, 90.0);
+    kneeling.thigh_rotations = [pitch(90.0); 2];
+    let out = settle(&mut SupportFloor::new(d), kneeling, 0.0, 1.0);
+    assert_eq!(out.support_weight, 0.0, "{out:?}");
+}
+
+#[test]
+fn squat_bow_thresholds_above_a_right_angle_restore_the_thigh_only_gate() {
+    for threshold in [1.6_f32, 2.0, 4.0] {
+        assert!(threshold > std::f32::consts::FRAC_PI_2);
+        let ablated = LegIkConfig {
+            squat_bow_start_tilt_rad: threshold,
+            squat_bow_full_tilt_rad: threshold,
+            ..LegIkConfig::default()
+        };
+        assert_eq!(ablated.sanitized(), ablated);
+        for degrees in [0.0_f32, 30.0, 45.0, 70.0, 90.0] {
+            let lean = pitch(degrees);
+            // Folded thighs: nothing, however far the torso bows...
+            let folded = folded_thigh_weight(ablated, lean, lean);
+            assert_eq!(
+                folded.support_weight, 0.0,
+                "{threshold}, {degrees}°: {folded:?}"
+            );
+            assert_eq!(folded.vertical_m, 0.0, "{threshold}, {degrees}°");
+            // ...where the default gives the prior back from 35°.
+            let default = folded_thigh_weight(LegIkConfig::default(), lean, lean);
+            if degrees >= 35.0 {
+                assert_eq!(default.support_weight, 1.0, "{degrees}°: {default:?}");
+            }
+            // The thigh taper itself is untouched by the ablation.
+            for (thigh, weight) in [(0.0_f32, 1.0_f32), (70.0, 0.5), (80.0, 0.0)] {
+                let mut input = floor_input(0.0, [SOLE + 0.015; 2], degrees, 0.0);
+                input.thigh_rotations = [pitch(thigh); 2];
+                let out = settle(&mut SupportFloor::new(ablated), input, 0.0, 1.0);
+                assert!(
+                    (out.support_weight - weight).abs() < 1.0e-3,
+                    "{threshold}, lean {degrees}°, thigh {thigh}°: {out:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn sanitized_repairs_bad_squat_bow_thresholds() {
+    let d = LegIkConfig::default();
+    let thresholds = |start: f32, full: f32| {
+        let c = LegIkConfig {
+            squat_bow_start_tilt_rad: start,
+            squat_bow_full_tilt_rad: full,
+            ..d
+        }
+        .sanitized();
+        // Nothing else changes, and the result is a fixed point.
+        assert_eq!(
+            LegIkConfig {
+                squat_bow_start_tilt_rad: d.squat_bow_start_tilt_rad,
+                squat_bow_full_tilt_rad: d.squat_bow_full_tilt_rad,
+                ..c
+            },
+            d
+        );
+        assert_eq!(c.sanitized(), c);
+        (c.squat_bow_start_tilt_rad, c.squat_bow_full_tilt_rad)
+    };
+    let defaults = (d.squat_bow_start_tilt_rad, d.squat_bow_full_tilt_rad);
+    for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.2] {
+        assert_eq!(
+            thresholds(bad, d.squat_bow_full_tilt_rad),
+            defaults,
+            "{bad}"
+        );
+        assert_eq!(
+            thresholds(d.squat_bow_start_tilt_rad, bad),
+            defaults,
+            "{bad}"
+        );
+        assert_eq!(thresholds(bad, bad), defaults, "{bad}");
+        // A valid partner that the repaired value would invert: both reset.
+        assert_eq!(thresholds(bad, 0.1), defaults, "{bad}");
+        assert_eq!(thresholds(1.2, bad), defaults, "{bad}");
+    }
+    // Inverted (full weight before any): both reset.
+    assert_eq!(thresholds(0.9, 0.3), defaults);
+    // Valid values are kept, including a hard step and the ablation.
+    assert_eq!(thresholds(0.2, 0.5), (0.2, 0.5));
+    assert_eq!(thresholds(0.4, 0.4), (0.4, 0.4));
+    assert_eq!(thresholds(2.0, 2.0), (2.0, 2.0));
+    // A repaired configuration behaves like the default one: half weight at
+    // 27.5°, the middle of 20–35°.
+    let repaired = LegIkConfig {
+        squat_bow_start_tilt_rad: f32::NAN,
+        squat_bow_full_tilt_rad: -3.0,
+        ..d
+    };
+    let out = folded_thigh_weight(repaired, pitch(27.5), pitch(27.5));
+    assert!((out.support_weight - 0.5).abs() < 2.0e-3, "{out:?}");
 }
 
 #[test]
