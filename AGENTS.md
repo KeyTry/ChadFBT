@@ -19,3 +19,5 @@ Use subagents for implementation and verification. Research platform/library API
 
 Use meaningful synthetic regressions for numerical invariants, reference frame conversions, stale data, malformed wire packets, and recovery gates. Record live validation separately. Do not describe unit tests as proof of accuracy or performance against SlimeVR. Local captures and hardware identifiers stay in gitignored local-data.
 
+Test fixtures use neutral, synthetic values. Never copy numbers from a real recording, saved profile or person into tests, code or docs: reproduce the mechanism a recording exposed, not its data. Body measurements count as personal data.
+
